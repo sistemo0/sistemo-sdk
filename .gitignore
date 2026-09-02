@@ -1,0 +1,62 @@
+# Repo-root ignores. Each package also carries its own .gitignore so it stays
+# self-contained if the two are ever split into separate repos — that overlap is
+# deliberate and costs nothing.
+
+# --- build output (never commit; PyPI/npm build these from source) ---
+dist/
+build/
+*.egg-info/
+*.tsbuildinfo
+
+# --- dependencies ---
+node_modules/
+.venv/
+venv/
+
+# --- test / tool caches ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+coverage/
+.coverage
+*.tgz
+
+# --- editors / OS ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- ⚠ founder-only, never published ---------------------------------------
+# MAINTAINERS.md is an internal ops document, not customer documentation: it
+# names production infrastructure, hosting providers, deploy prerequisites and
+# the private repo layout. None of that is a credential, but it is fleet
+# topology — the same class of fact this product deliberately strips from its own
+# API responses (`Machine.HostWireGuardIP` is `json:"-"` precisely so tenants
+# cannot learn it). Publishing it in the SDK repo would hand it over anyway.
+#
+# ⚠ And keep this comment vague. The first draft of it named the exact address
+# it was written to protect, which would have published the thing the ignore
+# rule exists to withhold.
+#
+# It stays HERE, beside the code it describes, so it does not rot in a folder
+# nobody opens. Outside contributors get CONTRIBUTING.md instead.
+#
+# ⚠ If you ever need it in a repo, put it in the PRIVATE one — never this one,
+# and never via `git add -f`.
+MAINTAINERS.md
+
+# --- ⚠ never commit credentials -------------------------------------------
+# This repo is PUBLIC. An SDK is the one place a real API key is most likely to
+# be pasted "just to test", and a leaked sk_live_ key can create machines and
+# spend a wallet. Keys belong in the environment (SISTEMO_API_KEY), never a file.
+.env
+.env.*
+*.pem
+*.key
+.npmrc
+.pypirc

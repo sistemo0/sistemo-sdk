@@ -1,0 +1,45 @@
+[build-system]
+# >=77 for PEP 639: `license` as an SPDX string + license-files.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sistemo"
+version = "0.1.0"
+description = "Run AI agents and untrusted code in real isolated microVMs."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Sistemo" }]
+keywords = ["sandbox", "firecracker", "microvm", "ai-agents", "code-execution"]
+dependencies = []  # zero runtime dependencies — stdlib only
+
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Testing",
+  "Topic :: System :: Emulators",
+]
+
+[project.urls]
+Homepage = "https://sistemo.io"
+Documentation = "https://docs.sistemo.io"
+# ⚠ These render as clickable links on the PyPI project page. They previously
+# pointed at a PRIVATE GitLab path, which resolves to a sign-in wall (HTTP 403)
+# — the worst possible landing for an open-core "audit it yourself" pitch.
+# Whatever repo is published must be PUBLIC and must actually exist.
+Repository = "https://github.com/sistemo0/sistemo-sdk"
+Issues = "https://github.com/sistemo0/sistemo-sdk/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sistemo*"]
+
+# PEP 561. Without this marker the package ships fully annotated and every type
+# checker ignores it — `mypy`/`pyright` treat an installed `sistemo` as Any, so
+# the types this SDK is written with never reach the developer who installed it.
+# The marker is only honoured if it is actually IN the wheel, hence package-data.
+[tool.setuptools.package-data]
+sistemo = ["py.typed"]

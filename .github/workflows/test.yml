@@ -1,0 +1,76 @@
+# Every push and PR. Without this the repo has NO gate: `.gitlab-ci.yml` is not
+# read by GitHub, so leaving that file as the only "CI" would be a gate that
+# looks present and does nothing.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ⚠ 3.9 is not decoration. pyproject declares `requires-python = ">=3.8"`,
+        # and the client has version-dependent behaviour: `socket.timeout` only
+        # became an alias of `TimeoutError` in 3.10, so a read timeout on an older
+        # interpreter takes a genuinely different except-branch. Testing only on
+        # a modern Python would leave the floor we advertise entirely unexercised.
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: unit tests
+        working-directory: python
+        run: python -m unittest discover -s tests -v
+      - name: build + metadata check
+        working-directory: python
+        run: |
+          python -m pip install --quiet --upgrade build twine
+          python -m build
+          # The same metadata validation PyPI runs on upload — a malformed README
+          # or licence field fails here rather than at release time, when the
+          # version number has already been burned.
+          python -m twine check dist/*
+      - name: py.typed must actually be in the wheel
+        working-directory: python
+        # PEP 561 is only honoured if the marker ships. It is declared in
+        # package-data, and a packaging change could silently drop it — after
+        # which the SDK is fully annotated and every type checker ignores it,
+        # with nothing failing anywhere to say so.
+        run: |
+          python - <<'EOF'
+          import glob, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          assert "sistemo/py.typed" in names, f"py.typed missing from {wheel}"
+          print("py.typed present in", wheel)
+          EOF
+
+  js:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - working-directory: js
+        run: npm ci
+      - name: typecheck
+        working-directory: js
+        run: npm run typecheck
+      - name: build + unit tests
+        working-directory: js
+        run: npm test

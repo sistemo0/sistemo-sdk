@@ -1,0 +1,100 @@
+# Publish on a tag. Two tag prefixes because the packages version independently:
+# a JS-only fix must not force an identical-contents Python release.
+#
+#   python-v0.1.0  -> PyPI
+#   js-v0.1.0      -> npm
+#
+# Each job re-runs the tests first. A release is the one moment a green build
+# actually matters, and "it passed on main" is not the same commit.
+name: release
+
+on:
+  push:
+    tags:
+      - "python-v*"
+      - "js-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  pypi:
+    if: startsWith(github.ref_name, 'python-v')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # PyPI Trusted Publishing (OIDC). This is why there is no PYPI_API_TOKEN
+      # secret: PyPI verifies the workflow identity directly, so there is no
+      # long-lived credential to store, leak, or forget to rotate.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: the tag IS the version
+        working-directory: python
+        # Publishing a tag whose number disagrees with the package produces a
+        # release nobody can trace back to a commit — and PyPI versions are
+        # immutable, so it cannot be fixed, only superseded.
+        run: |
+          want="${GITHUB_REF_NAME#python-v}"
+          have=$(python -c "import re,pathlib; print(re.search(r'(?m)^version\s*=\s*\"([^\"]+)\"', pathlib.Path('pyproject.toml').read_text()).group(1))")
+          echo "tag=$want pyproject=$have"
+          [ "$want" = "$have" ] || { echo "::error::tag $GITHUB_REF_NAME != pyproject version $have"; exit 1; }
+
+      - name: tests
+        working-directory: python
+        run: python -m unittest discover -s tests -v
+
+      - name: build
+        working-directory: python
+        run: |
+          python -m pip install --quiet --upgrade build twine
+          python -m build
+          python -m twine check dist/*
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
+
+  npm:
+    if: startsWith(github.ref_name, 'js-v')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # Enables `--provenance`: npm records a signed, verifiable link from the
+      # published tarball back to this workflow run and commit. For an
+      # "audit it yourself" product that link is the point.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: the tag IS the version
+        working-directory: js
+        run: |
+          want="${GITHUB_REF_NAME#js-v}"
+          have=$(node -p "require('./package.json').version")
+          echo "tag=$want package.json=$have"
+          [ "$want" = "$have" ] || { echo "::error::tag $GITHUB_REF_NAME != package.json version $have"; exit 1; }
+
+      - working-directory: js
+        run: npm ci
+
+      - name: tests
+        working-directory: js
+        run: npm test
+
+      - name: publish
+        working-directory: js
+        # `publishConfig.access=public` is in package.json — a scoped package
+        # without it fails the first publish asking for a paid private plan.
+        # prepublishOnly re-runs build + test one more time.
+        run: npm publish --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
