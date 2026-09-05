@@ -45,7 +45,9 @@ self-hosted control plane:
 export SISTEMO_API_KEY=sk_live_…
 export SISTEMO_BASE_URL=https://api.sistemo.io   # or your own host
 
-cd python && pip install -e .
+cd python
+python3 -m venv .venv && source .venv/bin/activate   # PEP 668: distro Pythons refuse a bare install
+pip install -e .
 python -c "from sistemo import Sandbox; sb=Sandbox(); print(sb.run('uname -a').stdout); sb.close()"
 ```
 

@@ -6,20 +6,40 @@ Run AI agents and untrusted code in **real isolated Firecracker microVMs** — s
 pip install sistemo
 ```
 
-## Quickstart (< 10 lines)
+On Debian, Ubuntu and Fedora the system Python is marked *externally managed*
+(PEP 668), so that call is refused with `error: externally-managed-environment`.
+Install into a virtual environment instead — this is about your OS, not this
+package:
 
-```python
-from sistemo import Sandbox
-
-with Sandbox() as sb:                       # reads SISTEMO_API_KEY
-    result = sb.run("python -c 'print(2 + 2)'")
-    print(result.stdout, result.exit_code)  # "4\n" 0
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install sistemo
 ```
 
-Get an API key from the dashboard (**Dashboard → API Keys**), then:
+## Quickstart (< 10 lines)
+
+First, get an API key from the dashboard (**Dashboard → API Keys**) and export it:
 
 ```bash
 export SISTEMO_API_KEY=sk_live_xxxxxxxx
+```
+
+Then save this as `hello.py` — it is a Python file, not something to paste at a shell
+prompt:
+
+```python
+# hello.py
+from sistemo import Sandbox
+
+with Sandbox() as sb:                       # reads SISTEMO_API_KEY
+    result = sb.run("python3 -c 'print(2 + 2)'")
+    print(result.stdout, result.exit_code)  # "4\n" 0
+```
+
+Then run it:
+
+```bash
+python hello.py
 ```
 
 ## Configuration

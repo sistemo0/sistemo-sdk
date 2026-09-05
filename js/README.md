@@ -10,7 +10,18 @@ Requires Node 18+ (uses the global `fetch`). Zero runtime dependencies.
 
 ## Quickstart (< 10 lines)
 
-```ts
+First, get an API key from the dashboard (**Dashboard → API Keys**) and export it:
+
+```bash
+export SISTEMO_API_KEY=sk_live_xxxxxxxx
+```
+
+Then save this as `hello.mjs` — it is a source file, not something to paste at a shell
+prompt. The `.mjs` extension matters: the snippet uses `import` and top-level
+`await`, so a plain `.js` file needs `"type": "module"` in your `package.json`.
+
+```js
+// hello.mjs
 import { Sandbox } from "@sistemo/sdk";
 
 const sb = await Sandbox.create();                  // reads SISTEMO_API_KEY
@@ -19,10 +30,10 @@ console.log(res.stdout, res.exitCode);              // "4\n" 0
 await sb.close();
 ```
 
-Get an API key from the dashboard (**Dashboard → API Keys**), then:
+Then run it:
 
 ```bash
-export SISTEMO_API_KEY=sk_live_xxxxxxxx
+node hello.mjs
 ```
 
 ## Configuration

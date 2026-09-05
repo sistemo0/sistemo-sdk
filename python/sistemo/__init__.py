@@ -5,7 +5,7 @@ Quickstart::
     from sistemo import Sandbox
 
     with Sandbox() as sb:               # reads SISTEMO_API_KEY
-        result = sb.run("python -c 'print(2 + 2)'")
+        result = sb.run("python3 -c 'print(2 + 2)'")
         print(result.stdout, result.exit_code)
 """
 
