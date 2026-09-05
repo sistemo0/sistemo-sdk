@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sistemo"
-version = "0.1.0"
+version = "0.1.1"
 description = "Run AI agents and untrusted code in real isolated microVMs."
 readme = "README.md"
 requires-python = ">=3.8"
