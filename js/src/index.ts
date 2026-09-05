@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.1.0";
+const USER_AGENT = "@sistemo/sdk/0.1.1";
 
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
