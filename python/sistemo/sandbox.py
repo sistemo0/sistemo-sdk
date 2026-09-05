@@ -31,7 +31,7 @@ class Sandbox:
         from sistemo import Sandbox
 
         with Sandbox() as sb:
-            r = sb.run("python -c 'print(2 + 2)'")
+            r = sb.run("python3 -c 'print(2 + 2)'")
             print(r.stdout, r.exit_code)
     """
 
