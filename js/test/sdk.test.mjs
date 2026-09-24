@@ -24,6 +24,7 @@ const state = {
   failQueue: [],
   idemCreate: new Map(),
   volumesNull: false,
+  jobs: new Map(),
 };
 
 function readBody(req) {
@@ -98,18 +99,50 @@ before(async () => {
       return;
     }
 
-    if (method === "POST" && path.endsWith("/exec")) {
+    if (method === "POST" && path.endsWith("/execs")) {
       const id = path.split("/")[3];
       if (!state.machines.has(id)) {
         send(res, 404, { detail: "not found" });
         return;
       }
       const script = body?.script || "";
-      send(res, 200, {
+      const eid = body?.exec_id || "e-1";
+      const rec = {
+        exec_id: eid,
+        machine_id: id,
+        state: "succeeded",
         exit_code: script.includes("fail") ? 1 : 0,
-        stdout: `out:${script}`,
-        stderr: "",
+        truncated: false,
+      };
+      state.jobs.set(eid, { rec, stdout: Buffer.from(`out:${script}`) });
+      send(res, 202, rec);
+      return;
+    }
+
+    if (method === "GET" && path.includes("/execs/") && path.endsWith("/output")) {
+      const eid = path.split("/")[5];
+      const job = state.jobs.get(eid) || {};
+      const offset = Number(url.searchParams.get("offset") || 0);
+      let data = url.searchParams.get("stream") === "stderr" ? Buffer.alloc(0) : (job.stdout || Buffer.alloc(0));
+      if (offset > 0) data = Buffer.alloc(0);
+      send(res, 200, {
+        stream: "stdout",
+        offset,
+        next_offset: offset + data.length,
+        data: data.length ? data.toString("base64") : "",
+        eof: true,
       });
+      return;
+    }
+
+    if (method === "GET" && path.includes("/execs/")) {
+      const eid = path.split("/")[5];
+      const job = state.jobs.get(eid);
+      if (!job) {
+        send(res, 404, { detail: "not found" });
+        return;
+      }
+      send(res, 200, job.rec);
       return;
     }
 
@@ -153,6 +186,7 @@ beforeEach(() => {
   state.failQueue = [];
   state.idemCreate.clear();
   state.volumesNull = false;
+  state.jobs.clear();
   delete process.env.SISTEMO_API_KEY;
   delete process.env.SISTEMO_BASE_URL;
 });
@@ -252,8 +286,10 @@ describe("Sandbox", () => {
     const r = await sb.run("echo hi");
     assert.equal(r.exitCode, 0);
     assert.equal(r.stdout, "out:echo hi");
-    const ex = state.log.find((l) => l.path.endsWith("/exec"));
-    assert.deepEqual(ex.body, { script: "echo hi", timeout_sec: 30 });
+    const ex = state.log.find((l) => l.path.endsWith("/execs"));
+    assert.equal(ex.body.script, "echo hi");
+    assert.equal(ex.body.timeout_sec, 120);
+    assert.ok(ex.body.exec_id);
     assert.equal(ex.idem, "");
 
     await sb.close();
@@ -339,7 +375,7 @@ describe("Sandbox", () => {
       { status: 200, body: { exit_code: 0, stdout: "should-not-run", stderr: "" } },
     ];
     await assert.rejects(() => sb.run("echo once"), (e) => e.status === 503);
-    assert.equal(state.log.filter((l) => l.path.endsWith("/exec")).length, 1);
+    assert.equal(state.log.filter((l) => l.path.endsWith("/execs")).length, 1);
   });
 });
 

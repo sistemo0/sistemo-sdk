@@ -17,12 +17,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ⚠ 3.9 is not decoration. pyproject declares `requires-python = ">=3.8"`,
-        # and the client has version-dependent behaviour: `socket.timeout` only
-        # became an alias of `TimeoutError` in 3.10, so a read timeout on an older
-        # interpreter takes a genuinely different except-branch. Testing only on
-        # a modern Python would leave the floor we advertise entirely unexercised.
-        python: ["3.9", "3.13"]
+        # Floor and current, and the floor is not decoration. pyproject declares
+        # `requires-python = ">=3.9"` and 3.9 is the FIRST entry here — those two
+        # numbers must stay equal. They were not: the floor said 3.8 while this
+        # matrix only ever ran 3.9, so the oldest interpreter we told people to
+        # use was never once exercised, and 3.8 had been EOL since Oct 2024.
+        #
+        # ⚠ The floor genuinely behaves differently, which is why testing it
+        # matters rather than being box-ticking: `socket.timeout` only became an
+        # alias of `TimeoutError` in 3.10, so a read timeout on 3.9 takes a
+        # different except-branch than on 3.14.
+        python: ["3.9", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

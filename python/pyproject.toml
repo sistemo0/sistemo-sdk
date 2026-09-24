@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sistemo"
-version = "0.1.1"
+version = "0.1.2"
 description = "Run AI agents and untrusted code in real isolated microVMs."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Sistemo" }]
@@ -18,10 +18,23 @@ dependencies = []  # zero runtime dependencies — stdlib only
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  # The package ships py.typed (see [tool.setuptools.package-data]); without
+  # this classifier PyPI does not advertise it and type-checker users cannot
+  # tell from the project page that the annotations reach them.
+  "Typing :: Typed",
   "Topic :: Software Development :: Testing",
   "Topic :: System :: Emulators",
 ]
+# ⚠ No "License :: OSI Approved ::" classifier ON PURPOSE. `license` above is a
+# PEP 639 SPDX expression, and setuptools>=77 ERRORS if both are present.
 
 [project.urls]
 Homepage = "https://sistemo.io"

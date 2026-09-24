@@ -49,7 +49,7 @@ Or pass them explicitly: `Sandbox.create({ apiKey: "sk_live_…", baseUrl: "http
 
 ```ts
 const sb = await Sandbox.create({ vcpus: 1, memoryMb: 1024, stack: "base" });
-const res = await sb.run("echo hi && uname -a", 30); // -> { exitCode, stdout, stderr }
+const res = await sb.run("echo hi && uname -a", 30); // -> { exitCode, stdout, stderr, truncated }
 await sb.close();                                    // destroy
 ```
 
@@ -78,3 +78,50 @@ dimension bound and how much is in use, and `GET /v1/quotas` reports every limit
 alongside current usage.
 
 Apache-2.0.
+
+## Long-running commands
+
+`sb.run()` holds the HTTP connection open for the whole command and is capped at
+**120 seconds**. Past that a command is not slow, it is impossible.
+
+`sb.start()` returns a handle instead:
+
+```ts
+const sb = await Sandbox.create();
+const job = await sb.start("npm ci && npm run build", 3600);
+
+for await (const chunk of job.stream()) process.stdout.write(chunk);
+
+await job.wait();
+console.log(job.state, job.exitCode);
+```
+
+The handle outlives the process that created it, so a crashed client can
+reconnect with `sb.job(execId)` or list what is running with `sb.jobs()`.
+
+### Three things worth knowing
+
+**`exitCode` is `null` until it is known** — and `null` forever if the job is
+`lost`. It is never `0` as a placeholder, because a zero would read as success.
+Branch on `state`, or use `job.ok`.
+
+**`lost` is not `failed`.** `failed` means the command ran and returned non-zero.
+`lost` means the machine could not account for it — neither that it ran nor that
+it did not. Do not retry blindly and do not assume completion.
+
+**A failed `start()` may still have started something.** On
+`ExecStartUnconfirmed` the command may be running; the error carries the handle:
+
+```ts
+let job;
+try {
+  job = await sb.start("./deploy.sh");
+} catch (e) {
+  if (!(e instanceof ExecStartUnconfirmed)) throw e;
+  job = await sb.job(e.execId);   // find out what actually happened
+}
+await job.wait();
+```
+
+An `Idempotency-Key` is sent automatically, so an ordinary network retry returns
+the *same* job rather than running your command twice.
