@@ -26,7 +26,7 @@
   "scripts": {
     "build": "npm run clean && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test \"test/*.test.mjs\"",
+    "test": "npm run build && node --test test/sdk.test.mjs test/async-exec.test.mjs",
     "prepublishOnly": "npm run build && npm test",
     "clean": "rm -rf dist"
   },
