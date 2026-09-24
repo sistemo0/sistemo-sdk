@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -68,7 +69,8 @@ class Handler(BaseHTTPRequestHandler):
             offset = int(q.get("offset", ["0"])[0])
             return self._send(200, next_page(offset))
         if "/execs/" in u.path:
-            return self._send(200, SCENE["job"])
+            rec = SCENE["get_job"] if "get_job" in SCENE else SCENE["job"]
+            return self._send(200, rec)
         if u.path.endswith("/execs"):
             return self._send(200, {"execs": [SCENE["job"]]})
         return self._send(200, SCENE["job"])
@@ -204,6 +206,33 @@ class AsyncExecTest(unittest.TestCase):
         self.assertTrue(keys, "start() sent no exec_id")
         self.assertEqual(job.id, keys[0])
 
+    def test_start_409_returns_the_existing_job(self):
+        """Re-sending the same exec_id is a replay, not a second run."""
+        SCENE["start_status"] = 409
+        SCENE["start_body"] = {"detail": "exec_id already exists"}
+        SCENE["job"] = job_rec("running")
+        sb = self.sandbox()
+        job = sb.start("echo hi", exec_id=SCENE["job"]["exec_id"])
+        self.assertEqual(job.id, SCENE["job"]["exec_id"])
+        self.assertEqual(job.state, "running")
+        self.assertEqual(len(SCENE.get("starts", [])), 1)
+
+    def test_run_polls_the_minted_id_when_start_is_unconfirmed(self):
+        """⚠ A lost start response is not a failure — run() waits on the id it minted."""
+        SCENE["start_status"] = 503
+        SCENE["start_body"] = {
+            "error": "could not confirm the command started",
+            "code": "unavailable",
+            "exec_id": "server-said-this",
+        }
+        SCENE["job"] = job_rec("succeeded", 0)
+        SCENE["pages"] = [page(0, b"ok\n", eof=True)]
+        sb = self.sandbox()
+        r = sb.run("echo hi")
+        self.assertEqual(r.exit_code, 0)
+        self.assertEqual(r.stdout, "ok\n")
+        self.assertEqual(len(SCENE.get("starts", [])), 1)
+
     def test_unconfirmed_start_keeps_the_exec_id(self):
         """⚠ A 503 here is NOT a failure — the command may be running.
 
@@ -236,6 +265,21 @@ class AsyncExecTest(unittest.TestCase):
         self.assertNotIsInstance(e, type(api_error(404, "x")))
 
     # ── waiting ─────────────────────────────────────────────────────
+
+    def test_wait_polls_before_sleeping(self):
+        """POST /execs returns running; the next GET is already succeeded.
+
+        Sleeping first would add a full poll interval to every sb.run() of a
+        fast command — hello-world would wait 1s for a 10ms echo.
+        """
+        SCENE["job"] = job_rec("running")
+        SCENE["get_job"] = job_rec("succeeded", 0)
+        job = self.sandbox().start("echo hi")
+        self.assertEqual(job.state, "running")
+        t0 = time.monotonic()
+        job.wait(poll_interval=3)
+        self.assertEqual(job.state, "succeeded")
+        self.assertLess(time.monotonic() - t0, 1.0)
 
     def test_wait_returns_immediately_when_already_terminal(self):
         j = Job(self.sandbox(), job_rec("succeeded", 0))

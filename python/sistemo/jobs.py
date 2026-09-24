@@ -113,8 +113,22 @@ class Job:
                     f"job {self.id} is still {self.state} after {timeout}s "
                     f"(it is still running; poll it again or cancel it)"
                 )
-            time.sleep(poll_interval)
+            # Refresh BEFORE sleeping. POST /execs returns running immediately,
+            # so a hello-world `sb.run("echo hi")` would otherwise wait a full
+            # poll interval for a command that finished in milliseconds.
             self.refresh()
+            if self.done:
+                return self
+            if deadline is None:
+                time.sleep(poll_interval)
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise JobTimeout(
+                        f"job {self.id} is still {self.state} after {timeout}s "
+                        f"(it is still running; poll it again or cancel it)"
+                    )
+                time.sleep(min(poll_interval, remaining))
 
     def cancel(self) -> "Job":
         """Stop the job: SIGTERM, a short grace period, then SIGKILL.

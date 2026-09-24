@@ -624,8 +624,23 @@ export class Job {
             `(it is still running; poll it again or cancel it)`,
         );
       }
-      await sleep(poll);
+      // Refresh BEFORE sleeping. POST /execs returns running immediately, so a
+      // hello-world `sb.run("echo hi")` would otherwise wait a full poll
+      // interval for a command that finished in milliseconds.
       await this.refresh();
+      if (this.done) return this;
+      if (deadline === undefined) {
+        await sleep(poll);
+      } else {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw new JobTimeout(
+            `job ${this.id} is still ${this.state} after ${opts.timeoutMs}ms ` +
+              `(it is still running; poll it again or cancel it)`,
+          );
+        }
+        await sleep(Math.min(poll, remaining));
+      }
     }
   }
 

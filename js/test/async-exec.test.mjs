@@ -68,7 +68,7 @@ before(async () => {
         return send(200, found ?? { stream: "stdout", offset, next_offset: offset, data: "", eof: true });
       }
       if (url.pathname.endsWith("/execs")) return send(200, { execs: [scene.job] });
-      return send(200, scene.job);
+      return send(200, scene.getJob ?? scene.job);
     });
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -178,6 +178,33 @@ describe("start semantics", () => {
     assert.equal(job.id, ids[0]);
   });
 
+  it("a 409 returns the existing job, not a second run", async () => {
+    scene.startStatus = 409;
+    scene.startBody = { detail: "exec_id already exists" };
+    scene.job = jobRec("running");
+    const sb = await newSandbox();
+    const job = await sb.start("echo hi", 120, { execId: scene.job.exec_id });
+    assert.equal(job.id, scene.job.exec_id);
+    assert.equal(job.state, "running");
+    assert.equal((scene.starts ?? []).length, 1);
+  });
+
+  it("run() polls the minted id when start is unconfirmed", async () => {
+    scene.startStatus = 503;
+    scene.startBody = {
+      error: "could not confirm the command started",
+      code: "unavailable",
+      exec_id: "server-said-this",
+    };
+    scene.job = jobRec("succeeded", 0);
+    scene.pages = [page(0, Buffer.from("ok\n"), true)];
+    const sb = await newSandbox();
+    const r = await sb.run("echo hi");
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.stdout, "ok\n");
+    assert.equal((scene.starts ?? []).length, 1);
+  });
+
   it("an unconfirmed start keeps the exec id", async () => {
     scene.startStatus = 503;
     scene.startBody = {
@@ -231,6 +258,18 @@ describe("start semantics", () => {
 });
 
 describe("waiting", () => {
+  it("polls before sleeping — a fast command must not wait a full interval", async () => {
+    scene.job = jobRec("running");
+    scene.getJob = jobRec("succeeded", 0);
+    const sb = await newSandbox();
+    const j = await sb.start("echo hi");
+    assert.equal(j.state, "running");
+    const t0 = Date.now();
+    await j.wait({ pollIntervalMs: 3000 });
+    assert.equal(j.state, "succeeded");
+    assert.ok(Date.now() - t0 < 1000, "wait() slept before the first poll");
+  });
+
   it("returns immediately when already terminal", async () => {
     scene.job = jobRec("succeeded", 0);
     const sb = await newSandbox();

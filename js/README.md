@@ -1,6 +1,6 @@
 # @sistemo/sdk (JavaScript / TypeScript)
 
-Run AI agents and untrusted code in **real isolated Firecracker microVMs** — self-host for free or use the cloud.
+Run AI agents and untrusted code in **real isolated Firecracker microVMs**
 
 ```bash
 npm install @sistemo/sdk
@@ -49,7 +49,7 @@ Or pass them explicitly: `Sandbox.create({ apiKey: "sk_live_…", baseUrl: "http
 
 ```ts
 const sb = await Sandbox.create({ vcpus: 1, memoryMb: 1024, stack: "base" });
-const res = await sb.run("echo hi && uname -a", 30); // -> { exitCode, stdout, stderr, truncated }
+const res = await sb.run("echo hi && uname -a");     // -> { exitCode, stdout, stderr, truncated } (default 120s, max 24h)
 await sb.close();                                    // destroy
 ```
 
@@ -81,19 +81,36 @@ Apache-2.0.
 
 ## Long-running commands
 
-`sb.run()` holds the HTTP connection open for the whole command and is capped at
-**120 seconds**. Past that a command is not slow, it is impossible.
-
-`sb.start()` returns a handle instead:
+`sb.run()` starts a guest job and waits for it on your machine (default **120
+seconds**, maximum 24 hours). Each poll is a short request, so a proxy never
+holds a connection for the whole command. Pass a longer timeout for installs
+and builds:
 
 ```ts
 const sb = await Sandbox.create();
-const job = await sb.start("npm ci && npm run build", 3600);
+try {
+  const r = await sb.run("npm ci && npm run build", 3600);
+  console.log(r.exitCode);
+} finally {
+  await sb.close();
+}
+```
 
-for await (const chunk of job.stream()) process.stdout.write(chunk);
+`sb.start()` returns the handle without waiting, when you want to stream,
+cancel, or reconnect:
 
-await job.wait();
-console.log(job.state, job.exitCode);
+```ts
+const sb = await Sandbox.create();
+try {
+  const job = await sb.start("npm ci && npm run build", 3600);
+
+  for await (const chunk of job.stream()) process.stdout.write(chunk);
+
+  await job.wait();
+  console.log(job.state, job.exitCode);
+} finally {
+  await sb.close();
+}
 ```
 
 The handle outlives the process that created it, so a crashed client can
@@ -123,5 +140,6 @@ try {
 await job.wait();
 ```
 
-An `Idempotency-Key` is sent automatically, so an ordinary network retry returns
-the *same* job rather than running your command twice.
+You mint `execId` (a UUID is generated if you omit it). Re-sending the same id
+is a 409 and returns the existing job, not a second run. If start throws
+`ExecStartUnconfirmed`, poll that id — do not start again.

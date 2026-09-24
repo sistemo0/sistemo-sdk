@@ -1,20 +1,24 @@
 # Contributing
 
-Both SDKs are deliberately small: a thin, **zero-dependency** wrapper over three
-REST calls (`POST /v1/machines`, `POST /v1/machines/{id}/exec`,
-`DELETE /v1/machines/{id}`), plus a few volume helpers. Nothing here should need
-a dependency, and adding one is the change most likely to be turned down — the
-value of an SDK you can read in one sitting is that you can also audit it.
+Both SDKs are deliberately small: a thin, **zero-dependency** wrapper over
+`POST /v1/machines`, the job API at `/v1/machines/{id}/execs` (start, poll,
+output, cancel), and `DELETE /v1/machines/{id}`, plus a few volume helpers.
+`sb.run()` is start + wait on that job. Nothing here should need a dependency,
+and adding one is the change most likely to be turned down — the value of an
+SDK you can read in one sitting is that you can also audit it.
 
 ## Layout
 
 ```
-python/   sistemo/{_client,sandbox,errors,_version}.py   tests/test_sdk.py
-js/       src/index.ts                                   test/sdk.test.mjs
+python/   sistemo/{_client,sandbox,jobs,errors,_version}.py
+          tests/{test_sdk,test_async_exec}.py
+js/       src/index.ts
+          test/{sdk,async-exec}.test.mjs
 ```
 
 `_client` / `Client` owns HTTP, auth, retries and error mapping. `Sandbox` is the
-thing users touch. `errors` maps an HTTP status to a type.
+thing users touch. `Job` is the handle `start()` returns. `errors` maps an HTTP
+status to a type.
 
 ## Running the tests
 
@@ -29,7 +33,7 @@ cd python && python3 -m unittest discover -s tests -v
 cd js && npm ci && npm test          # builds dist/, then node --test
 ```
 
-CI runs Python on 3.9 and 3.13, and Node on 20 and 24.
+CI runs Python on 3.9 and 3.14, and Node on 20 and 24.
 
 > ⚠ 3.9 is in the matrix on purpose. `socket.timeout` only became an alias of
 > `TimeoutError` in Python 3.10, so a read timeout takes a genuinely different
@@ -38,12 +42,12 @@ CI runs Python on 3.9 and 3.13, and Node on 20 and 24.
 
 ## Testing against a real server
 
-Point the SDK anywhere with `SISTEMO_BASE_URL` — the managed cloud, or your own
-self-hosted control plane:
+Point the SDK at production with `SISTEMO_BASE_URL` (or leave it unset; that is
+the default):
 
 ```bash
 export SISTEMO_API_KEY=sk_live_…
-export SISTEMO_BASE_URL=https://api.sistemo.io   # or your own host
+export SISTEMO_BASE_URL=https://api.sistemo.io
 
 cd python
 python3 -m venv .venv && source .venv/bin/activate   # PEP 668: distro Pythons refuse a bare install

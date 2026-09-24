@@ -1,6 +1,6 @@
 # sistemo (Python)
 
-Run AI agents and untrusted code in **real isolated Firecracker microVMs** — self-host for free or use the cloud.
+Run AI agents and untrusted code in **real isolated Firecracker microVMs**
 
 ```bash
 pip install sistemo
@@ -47,7 +47,7 @@ python3 hello.py
 | | |
 |---|---|
 | `SISTEMO_API_KEY` | your key (`sk_live_…`). Required. |
-| `SISTEMO_BASE_URL` | override the API URL (default `https://api.sistemo.io`; e.g. your self-hosted control plane). |
+| `SISTEMO_BASE_URL` | override the API URL (default `https://api.sistemo.io`). |
 
 Or pass them explicitly: `Sandbox(api_key="sk_live_…", base_url="https://…")`.
 
@@ -55,7 +55,7 @@ Or pass them explicitly: `Sandbox(api_key="sk_live_…", base_url="https://…")
 
 ```python
 sb = Sandbox(vcpus=1, memory_mb=1024, stack="base")  # provisions a microVM
-res = sb.run("echo hi && uname -a", timeout=30)            # -> ExecResult (max 24h)
+res = sb.run("echo hi && uname -a")                        # -> ExecResult (default 120s, max 24h)
 res.stdout, res.stderr, res.exit_code, res.ok, res.truncated
 sb.close()                                                 # destroy (or use `with`)
 ```
@@ -91,11 +91,18 @@ Zero runtime dependencies (Python stdlib only). Apache-2.0.
 
 ## Long-running commands
 
-`sb.run()` holds the HTTP connection open for the whole command and is capped at
-**120 seconds**. Past that a command is not slow, it is impossible — no proxy or
-load balancer between you and the machine will hold a request for a build.
+`sb.run()` starts a guest job and waits for it on your machine (default **120
+seconds**, maximum 24 hours). Each poll is a short request, so a proxy never
+holds a connection for the whole command. Pass a longer `timeout` for installs
+and builds:
 
-`sb.start()` returns a handle instead:
+```python
+with Sandbox() as sb:
+    r = sb.run("pip install numpy", timeout=180)
+```
+
+`sb.start()` returns the handle without waiting, when you want to stream,
+cancel, or reconnect:
 
 ```python
 from sistemo import Sandbox
@@ -128,7 +135,7 @@ ran nor that it did not. Do not retry blindly and do not assume completion.
 handle:
 
 ```python
-from sistemo.errors import ExecStartUnconfirmed
+from sistemo import ExecStartUnconfirmed
 
 try:
     job = sb.start("./deploy.sh")
@@ -137,5 +144,6 @@ except ExecStartUnconfirmed as e:
     job.wait()
 ```
 
-An `Idempotency-Key` is sent automatically, so an ordinary network retry returns
-the *same* job rather than running your command twice.
+You mint `exec_id` (a UUID is generated if you omit it). Re-sending the same id
+is a 409 and returns the existing job, not a second run. If start raises
+`ExecStartUnconfirmed`, poll that id — do not start again.
