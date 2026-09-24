@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from ._client import Client
 from .errors import APIError
+from .jobs import Job
 
 
 @dataclass
@@ -16,6 +17,7 @@ class ExecResult:
     exit_code: int
     stdout: str
     stderr: str
+    truncated: bool = False
 
     @property
     def ok(self) -> bool:
@@ -80,22 +82,84 @@ class Sandbox:
         self.root_volume_id: str = root_volume_id
         self._create_idempotency_key = key
 
-    def run(self, script: str, timeout: int = 30) -> ExecResult:
+    def run(self, script: str, timeout: int = 120) -> ExecResult:
         """Run a shell command/script inside the sandbox and return its output.
 
-        Connection drops may be retried by the client. HTTP 5xx/429 are **not**
-        retried for exec (no Idempotency-Key — replaying would re-run the script).
+        This is start + wait on a guest job (``POST /execs``). The default
+        ``timeout`` is 120 seconds; the ceiling is 24 hours. A proxy between you
+        and the API never holds the connection for the whole command.
+
+        HTTP 5xx/429 on start are **not** retried (replaying would re-run the
+        script). If start is unconfirmed, this still waits on the id we minted.
         """
-        out = self._client.request(
-            "POST",
-            f"/v1/machines/{self.id}/exec",
-            {"script": script, "timeout_sec": timeout},
-        )
+        from .errors import ExecStartUnconfirmed
+
+        eid = str(uuid.uuid4())
+        try:
+            job = self.start(script, timeout=timeout, exec_id=eid)
+        except ExecStartUnconfirmed:
+            job = self.job(eid)
+        job.wait()
+        code = -1 if job.exit_code is None else job.exit_code
         return ExecResult(
-            exit_code=int(out.get("exit_code", -1)),
-            stdout=out.get("stdout", "") or "",
-            stderr=out.get("stderr", "") or "",
+            exit_code=code,
+            stdout=job.logs("stdout"),
+            stderr=job.logs("stderr"),
+            truncated=job.truncated,
         )
+
+    def start(
+        self,
+        script: str,
+        timeout: int = 120,
+        *,
+        exec_id: str | None = None,
+    ) -> Job:
+        """Start a command and return a handle without waiting.
+
+        :meth:`run` is start + wait — use this when you want to stream, cancel,
+        or reconnect. Same guest job, same timeout ceiling (24 hours).
+
+        ⚠ You mint ``exec_id`` (a UUID is generated if you omit it). If the
+        start response is lost, poll that id rather than starting again.
+        Re-sending the same id is a 409, not a second run.
+
+        ⚠ If this raises :class:`~sistemo.errors.ExecStartUnconfirmed`, the
+        command **may be running**. The exception carries ``exec_id``; poll it
+        with :meth:`job` rather than starting over.
+        """
+        from .errors import NotFoundError
+
+        eid = exec_id or str(uuid.uuid4())
+        try:
+            rec = self._client.request(
+                "POST",
+                f"/v1/machines/{self.id}/execs",
+                {"exec_id": eid, "script": script, "timeout_sec": timeout},
+            )
+        except APIError as e:
+            if e.status == 409:
+                try:
+                    rec = self._client.request(
+                        "GET", f"/v1/machines/{self.id}/execs/{eid}"
+                    )
+                except NotFoundError:
+                    raise e from None
+            else:
+                raise
+        return Job(self, rec)
+
+    def job(self, exec_id: str) -> Job:
+        """Re-attach to a job by id — after a crash, or after an unconfirmed start."""
+        rec = self._client.request("GET", f"/v1/machines/{self.id}/execs/{exec_id}")
+        return Job(self, rec)
+
+    def jobs(self, limit: int = 50) -> list[Job]:
+        """List this sandbox's async jobs, newest first."""
+        out = self._client.request(
+            "GET", f"/v1/machines/{self.id}/execs?limit={int(limit)}"
+        )
+        return [Job(self, r) for r in (out.get("execs") or [])]
 
     def close(self, preserve_storage: bool = False) -> None:
         """Destroy the sandbox (and its disk unless ``preserve_storage``)."""

@@ -7,6 +7,7 @@ No network / real API required. Run from sdk/python:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pathlib
@@ -49,6 +50,7 @@ class _MockAPI(BaseHTTPRequestHandler):
     idem_create: dict[str, str] = {}
     # Empty volumes list returns null (real API quirk).
     volumes_null: bool = False
+    jobs: dict[str, dict] = {}
 
     def log_message(self, format: str, *args) -> None:  # quiet
         return
@@ -124,20 +126,52 @@ class _MockAPI(BaseHTTPRequestHandler):
             self._send(201, m)
             return
 
-        if method == "POST" and path.endswith("/exec"):
+        if method == "POST" and path.endswith("/execs"):
             mid = path.split("/")[3]
             if mid not in _MockAPI.machines:
                 self._send(404, {"detail": "not found", "code": "not_found"})
                 return
             script = (body or {}).get("script", "")
+            eid = (body or {}).get("exec_id") or "e-1"
+            rec = {
+                "exec_id": eid,
+                "machine_id": mid,
+                "state": "succeeded",
+                "exit_code": 0 if "fail" not in script else 1,
+                "truncated": False,
+            }
+            _MockAPI.jobs[eid] = {"rec": rec, "stdout": f"out:{script}".encode()}
+            self._send(202, rec)
+            return
+
+        if method == "GET" and "/execs/" in path and path.endswith("/output"):
+            eid = path.split("/")[5]
+            job = _MockAPI.jobs.get(eid, {})
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(full_path).query)
+            offset = int(q.get("offset", ["0"])[0])
+            data = job.get("stdout", b"") if q.get("stream", ["stdout"])[0] != "stderr" else b""
+            if offset > 0:
+                data = b""
             self._send(
                 200,
                 {
-                    "exit_code": 0 if "fail" not in script else 1,
-                    "stdout": f"out:{script}",
-                    "stderr": "",
+                    "stream": "stdout",
+                    "offset": offset,
+                    "next_offset": offset + len(data),
+                    "data": base64.b64encode(data).decode() if data else "",
+                    "eof": True,
                 },
             )
+            return
+
+        if method == "GET" and "/execs/" in path:
+            eid = path.split("/")[5]
+            job = _MockAPI.jobs.get(eid)
+            if not job:
+                self._send(404, {"detail": "not found", "code": "not_found"})
+                return
+            self._send(200, job["rec"])
             return
 
         if method == "DELETE" and path.startswith("/v1/machines/"):
@@ -184,6 +218,7 @@ class SDKTest(unittest.TestCase):
         _MockAPI.fail_queue = []
         _MockAPI.idem_create.clear()
         _MockAPI.volumes_null = False
+        _MockAPI.jobs.clear()
         # isolate env
         self._env = os.environ.copy()
         os.environ.pop("SISTEMO_API_KEY", None)
@@ -228,9 +263,10 @@ class SDKTest(unittest.TestCase):
         self.assertEqual(r.exit_code, 0)
         self.assertTrue(r.ok)
         self.assertEqual(r.stdout, "out:echo hi")
-        exec_log = next(x for x in _MockAPI.log if x["path"].endswith("/exec"))
-        self.assertEqual(exec_log["body"]["timeout_sec"], 30)
-        # exec must NOT send Idempotency-Key (replay would re-run the script)
+        exec_log = next(x for x in _MockAPI.log if x["path"].endswith("/execs"))
+        self.assertEqual(exec_log["body"]["timeout_sec"], 120)
+        self.assertTrue(exec_log["body"].get("exec_id"))
+        # start must NOT send Idempotency-Key (replay would re-run the script)
         self.assertEqual(exec_log["idem"], "")
 
         sb.close()
@@ -373,7 +409,7 @@ class SDKTest(unittest.TestCase):
             sb.run("echo once")
         self.assertEqual(cm.exception.status, 503)
         # only one attempt — the queued success response was not consumed
-        execs = [x for x in _MockAPI.log if x["path"].endswith("/exec")]
+        execs = [x for x in _MockAPI.log if x["path"].endswith("/execs")]
         self.assertEqual(len(execs), 1)
 
     def test_create_retry_reuses_same_idem_key(self) -> None:

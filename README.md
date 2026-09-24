@@ -36,7 +36,7 @@ console.log(r.stdout, r.exitCode);
 await sb.close();
 ```
 
-Both SDKs are thin, **zero-dependency** wrappers over the REST API (`POST /v1/machines`, `POST /v1/machines/{id}/exec`, `DELETE /v1/machines/{id}`). Self-hosting? Point `SISTEMO_BASE_URL` at your own control plane.
+Both SDKs are thin, **zero-dependency** wrappers over the REST API (`POST /v1/machines`, `POST /v1/machines/{id}/execs`, `DELETE /v1/machines/{id}`). `sb.run()` is start + wait on a guest job (default 120s, max 24 hours).
 
 See each package's README for configuration, the full API, and error handling.
 

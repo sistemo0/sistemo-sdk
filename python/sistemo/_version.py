@@ -13,4 +13,4 @@ agree" drift this project keeps getting bitten by. ``_client`` now derives the
 UA from here, and ``test_version_matches_pyproject`` pins the third.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

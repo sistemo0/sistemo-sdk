@@ -128,14 +128,19 @@ class Client:
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:
             raw = e.read()
-            detail, code = "request failed", None
+            detail, code, parsed = "request failed", None, None
             try:
                 parsed = json.loads(raw)
-                detail = parsed.get("detail", detail)
+                # Some errors use `error` rather than `detail` (an unconfirmed
+                # exec start is the live example), so fall back rather than
+                # reporting "request failed" over a message that was right there.
+                detail = parsed.get("detail") or parsed.get("error") or detail
                 code = parsed.get("code")
             except Exception:
-                pass
-            raise api_error(e.code, detail, code) from None
+                parsed = None
+            raise api_error(
+                e.code, detail, code, parsed if isinstance(parsed, dict) else None
+            ) from None
         except urllib.error.URLError as e:
             raise SistemoError(f"connection error: {e.reason}") from e
         except (socket.timeout, TimeoutError) as e:
