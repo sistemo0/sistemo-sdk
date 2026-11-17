@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.1.2";
+const USER_AGENT = "@sistemo/sdk/0.1.3";
 
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -35,20 +35,36 @@ export class APIError extends SistemoError {
    * that away would leave it unaddressable.
    */
   readonly body: Record<string, unknown>;
-  constructor(status: number, detail: string, code?: string, body?: Record<string, unknown>) {
+  /** Seconds from `Retry-After`, capped at 60. */
+  readonly retryAfter?: number;
+  private readonly explicitRequestId?: string;
+  constructor(
+    status: number,
+    detail: string,
+    code?: string,
+    body?: Record<string, unknown>,
+    extra?: { retryAfter?: number; requestId?: string },
+  ) {
     super(`[${status}] ${detail}${code ? ` (${code})` : ""}`);
     this.name = "APIError";
     this.status = status;
     this.detail = detail;
     this.code = code;
     this.body = body ?? {};
+    this.retryAfter = extra?.retryAfter;
+    this.explicitRequestId = extra?.requestId;
+  }
+  get requestId(): string | undefined {
+    if (this.explicitRequestId) return this.explicitRequestId;
+    const v = this.body.request_id;
+    return typeof v === "string" ? v : undefined;
   }
 }
 
 /** 401/403 — key missing, invalid, revoked, or a read-only key on a mutation. */
 export class AuthError extends APIError {}
 /**
- * 403 `quota_exceeded` — an account limit was reached.
+ * 403 `quota_exceeded` — this request would exceed an account limit.
  *
  * Deliberately NOT an `AuthError`, even though both arrive as 403. They need
  * opposite handling, and conflating them sends callers to the wrong place:
@@ -112,19 +128,20 @@ function apiError(
   detail: string,
   code?: string,
   body?: Record<string, unknown>,
+  extra?: { retryAfter?: number; requestId?: string },
 ): APIError {
   // 403 is two different things, told apart by `code` — never by the status.
-  if (status === 403 && code === "quota_exceeded") return new QuotaExceededError(status, detail, code, body);
-  if (status === 401 || status === 403) return new AuthError(status, detail, code, body);
-  if (status === 404) return new NotFoundError(status, detail, code, body);
-  if (status === 410) return new GoneError(status, detail, code, body);
-  if (status === 429) return new RateLimitError(status, detail, code, body);
-  if (status === 501) return new AsyncExecUnsupportedError(status, detail, code, body);
+  if (status === 403 && code === "quota_exceeded") return new QuotaExceededError(status, detail, code, body, extra);
+  if (status === 401 || status === 403) return new AuthError(status, detail, code, body, extra);
+  if (status === 404) return new NotFoundError(status, detail, code, body, extra);
+  if (status === 410) return new GoneError(status, detail, code, body, extra);
+  if (status === 429) return new RateLimitError(status, detail, code, body, extra);
+  if (status === 501) return new AsyncExecUnsupportedError(status, detail, code, body, extra);
   // ⚠ Only a 503 that NAMES an exec is the unconfirmed-start case. A plain 503
   // (no host available, say) is an ordinary retryable error and must not be
   // dressed up as a command that might be running.
-  if (status === 503 && body && body.exec_id) return new ExecStartUnconfirmed(status, detail, code, body);
-  return new APIError(status, detail, code, body);
+  if (status === 503 && body && body.exec_id) return new ExecStartUnconfirmed(status, detail, code, body, extra);
+  return new APIError(status, detail, code, body, extra);
 }
 
 function newIdempotencyKey(): string {
@@ -136,6 +153,44 @@ function newIdempotencyKey(): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+const RETRY_AFTER_CAP_SEC = 60;
+
+/** Seconds from a Retry-After header (delta-seconds or HTTP-date), capped at 60. */
+export function parseRetryAfter(value: string | null | undefined): number | undefined {
+  if (value == null || value === "") return undefined;
+  const text = String(value).trim();
+  if (/^-?\d+$/.test(text)) {
+    const secs = Number(text);
+    if (!Number.isFinite(secs) || secs < 0) return undefined;
+    return Math.min(secs, RETRY_AFTER_CAP_SEC);
+  }
+  const ms = Date.parse(text);
+  if (Number.isNaN(ms)) return undefined;
+  const delay = (ms - Date.now()) / 1000;
+  if (delay < 0) return 0;
+  return Math.min(delay, RETRY_AFTER_CAP_SEC);
+}
+
+/** Milliseconds to wait before the next attempt. Tests pass `rand` so they do not sleep. */
+export function retryDelayMs(
+  attempt: number,
+  backoffMs: number,
+  maxBackoffMs: number,
+  err?: { status: number; retryAfter?: number },
+  rand: () => number = Math.random,
+): number {
+  const base = Math.min(maxBackoffMs, backoffMs * 2 ** attempt);
+  let delay = base * (0.5 + rand());
+  if (err?.status === 429) {
+    if (err.retryAfter == null) {
+      delay = Math.max(delay, base);
+    } else {
+      delay = Math.min(Math.max(delay, err.retryAfter * 1000), RETRY_AFTER_CAP_SEC * 1000);
+    }
+  }
+  return delay;
 }
 
 export interface ClientOptions {
@@ -162,6 +217,7 @@ export interface RequestOptions {
 /** Low-level API client. Most users want {@link Sandbox} instead. */
 export class Client {
   readonly baseUrl: string;
+  lastRequestId?: string;
   private readonly apiKey: string;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
@@ -194,10 +250,24 @@ export class Client {
     const retries = opts.maxRetries ?? this.maxRetries;
     const methodU = method.toUpperCase();
     let lastErr: unknown;
+    const headers = { ...(opts.headers ?? {}) };
+    let reqId: string | undefined;
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === "x-request-id" && v) {
+        reqId = v;
+        break;
+      }
+    }
+    if (!reqId) {
+      reqId = newIdempotencyKey();
+      headers["X-Request-Id"] = reqId;
+    }
+    this.lastRequestId = reqId;
+    const next = { ...opts, headers };
 
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        return await this.once<T>(methodU, path, body, opts);
+        return await this.once<T>(methodU, path, body, next);
       } catch (e) {
         lastErr = e;
         const can =
@@ -260,7 +330,11 @@ export class Client {
       } catch {
         /* non-JSON error body */
       }
-      throw apiError(res.status, detail, code, body);
+      const retryAfter = parseRetryAfter(res.headers.get("Retry-After"));
+      let requestId: string | undefined;
+      if (body && typeof body.request_id === "string") requestId = body.request_id;
+      if (!requestId) requestId = res.headers.get("X-Request-Id") ?? this.lastRequestId;
+      throw apiError(res.status, detail, code, body, { retryAfter, requestId: requestId ?? undefined });
     }
     return (text ? JSON.parse(text) : {}) as T;
   }
@@ -278,13 +352,9 @@ export class Client {
   }
 
   private async backoff(attempt: number, err?: APIError): Promise<void> {
-    const base = Math.min(
-      this.retryMaxBackoffMs,
-      this.retryBackoffMs * 2 ** attempt,
+    await sleep(
+      retryDelayMs(attempt, this.retryBackoffMs, this.retryMaxBackoffMs, err),
     );
-    let delay = base * (0.5 + Math.random());
-    if (err?.status === 429) delay = Math.max(delay, base);
-    await sleep(delay);
   }
 
   // --- volumes (incl. detachable root volumes) ---------------------------
@@ -348,6 +418,7 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   truncated?: boolean;
+  requestId?: string;
 }
 
 export interface SandboxOptions extends ClientOptions {
@@ -412,11 +483,15 @@ export class Sandbox {
    * This is start + wait on a guest job (`POST /execs`). Default timeout 120s,
    * ceiling 24 hours. A proxy never holds the connection for the whole command.
    */
-  async run(script: string, timeoutSec = 120): Promise<ExecResult> {
+  async run(
+    script: string,
+    timeoutSec = 120,
+    opts: { env?: Record<string, string>; cwd?: string } = {},
+  ): Promise<ExecResult> {
     const execId = newIdempotencyKey();
     let job: Job;
     try {
-      job = await this.start(script, timeoutSec, { execId });
+      job = await this.start(script, timeoutSec, { execId, ...opts });
     } catch (e) {
       if (e instanceof ExecStartUnconfirmed) {
         job = await this.job(execId);
@@ -431,6 +506,7 @@ export class Sandbox {
       stdout: dec.decode(await job.output("stdout")),
       stderr: dec.decode(await job.output("stderr")),
       truncated: job.truncated,
+      requestId: job.requestId,
     };
   }
 
@@ -450,18 +526,30 @@ export class Sandbox {
   async start(
     script: string,
     timeoutSec = 120,
-    opts: { execId?: string } = {},
+    opts: { execId?: string; env?: Record<string, string>; cwd?: string } = {},
   ): Promise<Job> {
     const execId = opts.execId ?? newIdempotencyKey();
+    const body: Record<string, unknown> = { exec_id: execId, script, timeout_sec: timeoutSec };
+    if (opts.env && Object.keys(opts.env).length) body.env = opts.env;
+    if (opts.cwd) body.cwd = opts.cwd;
     try {
       const rec = await this.client.request<JobRecord>(
         "POST",
         `/v1/machines/${this.id}/execs`,
-        { exec_id: execId, script, timeout_sec: timeoutSec },
+        body,
       );
       return new Job(this.client, this.id, rec);
     } catch (e) {
       if (e instanceof APIError && e.status === 409) {
+        if (
+          e.code === "too_many_execs" ||
+          e.code === "machine_process_limit" ||
+          e.code === "machine_disk_full" ||
+          e.code === "machine_out_of_memory" ||
+          e.code === "machine_not_running"
+        ) {
+          throw e;
+        }
         try {
           const rec = await this.client.request<JobRecord>(
             "GET",
@@ -537,6 +625,7 @@ export class Job {
   id = "";
   machineId = "";
   state = "";
+  requestId?: string;
   /**
    * ⚠ `null` until known, and null FOREVER when `state` is `"lost"`. Never
    * coerce this to 0 — a zero here reads as "the command succeeded".
@@ -553,6 +642,7 @@ export class Job {
     private readonly sandboxId: string,
     rec: JobRecord,
   ) {
+    this.requestId = client.lastRequestId;
     this.apply(rec);
   }
 

@@ -56,7 +56,8 @@ Or pass them explicitly: `Sandbox(api_key="sk_live_…", base_url="https://…")
 ```python
 sb = Sandbox(vcpus=1, memory_mb=1024, stack="base")  # provisions a microVM
 res = sb.run("echo hi && uname -a")                        # -> ExecResult (default 120s, max 24h)
-res.stdout, res.stderr, res.exit_code, res.ok, res.truncated
+res.stdout, res.stderr, res.exit_code, res.ok, res.truncated, res.request_id
+sb.run("python3 app.py", env={"FOO": "bar"}, cwd="/tmp")   # env/cwd omitted unless set
 sb.close()                                                 # destroy (or use `with`)
 ```
 
@@ -78,7 +79,7 @@ except QuotaExceededError as e:
 except AuthError:
     ...          # 401/403 — key missing/invalid/revoked, or read-only key
 except APIError as e:
-    print(e.status, e.detail, e.code)
+    print(e.status, e.detail, e.code, e.request_id)
 ```
 
 Both `QuotaExceededError` and `AuthError` arrive as HTTP 403, so **catch
@@ -86,6 +87,9 @@ Both `QuotaExceededError` and `AuthError` arrive as HTTP 403, so **catch
 precisely because the two need opposite handling: an auth failure never succeeds
 on retry, a quota refusal does once you free something. `GET /v1/quotas` reports
 every limit alongside current usage.
+
+Every request sends `X-Request-Id`. Quote `e.request_id` when you contact support.
+On `429`, the client honours `Retry-After` (capped at 60 s) from version 0.1.3.
 
 Zero runtime dependencies (Python stdlib only). Apache-2.0.
 

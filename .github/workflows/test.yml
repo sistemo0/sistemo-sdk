@@ -13,7 +13,10 @@ permissions:
 
 jobs:
   python:
-    runs-on: ubuntu-latest
+    # GitHub moved ubuntu-latest to 26.04; actions/setup-python has no 3.9
+    # build for that image (PR #4 failed at setup, tests never ran). Keep the
+    # advertised floor on 24.04 so the job still exercises 3.9.
+    runs-on: ${{ matrix.python == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:

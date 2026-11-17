@@ -18,6 +18,7 @@ class ExecResult:
     stdout: str
     stderr: str
     truncated: bool = False
+    request_id: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -82,21 +83,30 @@ class Sandbox:
         self.root_volume_id: str = root_volume_id
         self._create_idempotency_key = key
 
-    def run(self, script: str, timeout: int = 120) -> ExecResult:
+    def run(
+        self,
+        script: str,
+        timeout: int = 120,
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> ExecResult:
         """Run a shell command/script inside the sandbox and return its output.
 
         This is start + wait on a guest job (``POST /execs``). The default
         ``timeout`` is 120 seconds; the ceiling is 24 hours. A proxy between you
         and the API never holds the connection for the whole command.
 
-        HTTP 5xx/429 on start are **not** retried (replaying would re-run the
-        script). If start is unconfirmed, this still waits on the id we minted.
+        ``env`` and ``cwd`` are sent only when set, so option-less starts still
+        work on older guest agents. HTTP 5xx/429 on start are **not** retried
+        (replaying would re-run the script). If start is unconfirmed, this still
+        waits on the id we minted.
         """
         from .errors import ExecStartUnconfirmed
 
         eid = str(uuid.uuid4())
         try:
-            job = self.start(script, timeout=timeout, exec_id=eid)
+            job = self.start(script, timeout=timeout, exec_id=eid, env=env, cwd=cwd)
         except ExecStartUnconfirmed:
             job = self.job(eid)
         job.wait()
@@ -106,6 +116,7 @@ class Sandbox:
             stdout=job.logs("stdout"),
             stderr=job.logs("stderr"),
             truncated=job.truncated,
+            request_id=job.request_id,
         )
 
     def start(
@@ -114,6 +125,8 @@ class Sandbox:
         timeout: int = 120,
         *,
         exec_id: str | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
     ) -> Job:
         """Start a command and return a handle without waiting.
 
@@ -122,7 +135,8 @@ class Sandbox:
 
         ⚠ You mint ``exec_id`` (a UUID is generated if you omit it). If the
         start response is lost, poll that id rather than starting again.
-        Re-sending the same id is a 409, not a second run.
+        Re-sending the same id is a 409 ``exec_id_in_use``, not a second run.
+        ``too_many_execs`` is a different 409: wait for a command to finish.
 
         ⚠ If this raises :class:`~sistemo.errors.ExecStartUnconfirmed`, the
         command **may be running**. The exception carries ``exec_id``; poll it
@@ -131,14 +145,27 @@ class Sandbox:
         from .errors import NotFoundError
 
         eid = exec_id or str(uuid.uuid4())
+        body: dict = {"exec_id": eid, "script": script, "timeout_sec": timeout}
+        if env:
+            body["env"] = env
+        if cwd:
+            body["cwd"] = cwd
         try:
             rec = self._client.request(
                 "POST",
                 f"/v1/machines/{self.id}/execs",
-                {"exec_id": eid, "script": script, "timeout_sec": timeout},
+                body,
             )
         except APIError as e:
             if e.status == 409:
+                if e.code in (
+                    "too_many_execs",
+                    "machine_process_limit",
+                    "machine_disk_full",
+                    "machine_out_of_memory",
+                    "machine_not_running",
+                ):
+                    raise
                 try:
                     rec = self._client.request(
                         "GET", f"/v1/machines/{self.id}/execs/{eid}"

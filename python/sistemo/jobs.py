@@ -38,6 +38,7 @@ class Job:
 
     def __init__(self, sandbox: "Sandbox", record: dict):
         self._sb = sandbox
+        self.request_id: str | None = getattr(sandbox._client, "last_request_id", None)
         self._apply(record)
 
     # ── state ───────────────────────────────────────────────────────
