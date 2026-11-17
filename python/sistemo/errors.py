@@ -16,6 +16,9 @@ class APIError(SistemoError):
         detail: str,
         code: str | None = None,
         body: dict | None = None,
+        *,
+        retry_after: float | None = None,
+        request_id: str | None = None,
     ):
         self.status = status
         self.detail = detail
@@ -26,10 +29,22 @@ class APIError(SistemoError):
         #: ``start()`` returns the ``exec_id`` of a command that may well be
         #: running, and throwing that away would leave it unaddressable.
         self.body = body or {}
+        #: Seconds from ``Retry-After``, capped at 60. ``None`` when the header
+        #: was absent or unparseable.
+        self.retry_after = retry_after
+        self._request_id = request_id
         msg = f"[{status}] {detail}"
         if code:
             msg += f" ({code})"
         super().__init__(msg)
+
+    @property
+    def request_id(self) -> str | None:
+        """Correlation id for this call (body, then the ``X-Request-Id`` we sent)."""
+        if self._request_id:
+            return self._request_id
+        rid = self.body.get("request_id")
+        return str(rid) if rid else None
 
 
 class AuthError(APIError):
@@ -37,7 +52,7 @@ class AuthError(APIError):
 
 
 class QuotaExceededError(APIError):
-    """403 `quota_exceeded` — an account limit was reached.
+    """403 `quota_exceeded` — this request would exceed an account limit.
 
     Deliberately NOT an :class:`AuthError`, even though both arrive as 403. The
     two need opposite handling and conflating them sends callers to the wrong
@@ -104,25 +119,32 @@ class RateLimitError(APIError):
 
 
 def api_error(
-    status: int, detail: str, code: str | None = None, body: dict | None = None
+    status: int,
+    detail: str,
+    code: str | None = None,
+    body: dict | None = None,
+    *,
+    retry_after: float | None = None,
+    request_id: str | None = None,
 ) -> APIError:
     """Map an HTTP status to the most specific APIError subclass."""
+    kw = {"retry_after": retry_after, "request_id": request_id}
     # 403 is two different things, told apart by `code` — never by the status.
     if status == 403 and code == "quota_exceeded":
-        return QuotaExceededError(status, detail, code, body)
+        return QuotaExceededError(status, detail, code, body, **kw)
     if status in (401, 403):
-        return AuthError(status, detail, code, body)
+        return AuthError(status, detail, code, body, **kw)
     if status == 404:
-        return NotFoundError(status, detail, code, body)
+        return NotFoundError(status, detail, code, body, **kw)
     if status == 410:
-        return GoneError(status, detail, code, body)
+        return GoneError(status, detail, code, body, **kw)
     if status == 429:
-        return RateLimitError(status, detail, code, body)
+        return RateLimitError(status, detail, code, body, **kw)
     if status == 501:
-        return AsyncExecUnsupportedError(status, detail, code, body)
+        return AsyncExecUnsupportedError(status, detail, code, body, **kw)
     # ⚠ Only a 503 that NAMES an exec is the unconfirmed-start case. A plain 503
     # (no host available, say) is an ordinary retryable error and must not be
     # dressed up as a command that might be running.
     if status == 503 and body and body.get("exec_id"):
-        return ExecStartUnconfirmed(status, detail, code, body)
-    return APIError(status, detail, code, body)
+        return ExecStartUnconfirmed(status, detail, code, body, **kw)
+    return APIError(status, detail, code, body, **kw)

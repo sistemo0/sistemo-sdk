@@ -51,6 +51,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
         if self.path.endswith("/execs"):
             SCENE.setdefault("starts", []).append(body.get("exec_id"))
+            SCENE.setdefault("start_bodies", []).append(body)
             if SCENE.get("start_status"):
                 return self._send(SCENE["start_status"], SCENE.get("start_body", {}))
             rec = dict(SCENE["job"])
@@ -69,6 +70,7 @@ class Handler(BaseHTTPRequestHandler):
             offset = int(q.get("offset", ["0"])[0])
             return self._send(200, next_page(offset))
         if "/execs/" in u.path:
+            SCENE.setdefault("gets", []).append(u.path)
             rec = SCENE["get_job"] if "get_job" in SCENE else SCENE["job"]
             return self._send(200, rec)
         if u.path.endswith("/execs"):
@@ -216,6 +218,28 @@ class AsyncExecTest(unittest.TestCase):
         self.assertEqual(job.id, SCENE["job"]["exec_id"])
         self.assertEqual(job.state, "running")
         self.assertEqual(len(SCENE.get("starts", [])), 1)
+
+    def test_start_too_many_execs_does_not_get(self):
+        from sistemo.errors import APIError
+
+        SCENE["start_status"] = 409
+        SCENE["start_body"] = {
+            "code": "too_many_execs",
+            "detail": "the machine is already running its maximum number of concurrent commands",
+        }
+        SCENE["job"] = job_rec("running")
+        sb = self.sandbox()
+        with self.assertRaises(APIError) as cm:
+            sb.start("echo hi")
+        self.assertEqual(cm.exception.code, "too_many_execs")
+        self.assertFalse(SCENE.get("gets"))
+
+    def test_start_sends_env(self):
+        SCENE["job"] = job_rec("running")
+        sb = self.sandbox()
+        sb.start("echo hi", env={"FOO": "bar"})
+        self.assertEqual(SCENE["start_bodies"][0]["env"], {"FOO": "bar"})
+        self.assertNotIn("cwd", SCENE["start_bodies"][0])
 
     def test_run_polls_the_minted_id_when_start_is_unconfirmed(self):
         """⚠ A lost start response is not a failure — run() waits on the id it minted."""

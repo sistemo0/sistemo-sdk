@@ -57,6 +57,7 @@ before(async () => {
         let parsed = {};
         try { parsed = JSON.parse(Buffer.concat(bodyChunks).toString() || "{}"); } catch { /* ignore */ }
         (scene.starts ??= []).push(parsed.exec_id);
+        (scene.startBodies ??= []).push(parsed);
         if (scene.startStatus) return send(scene.startStatus, scene.startBody ?? {});
         return send(202, { ...scene.job, exec_id: parsed.exec_id ?? scene.job.exec_id });
       }
@@ -68,6 +69,7 @@ before(async () => {
         return send(200, found ?? { stream: "stdout", offset, next_offset: offset, data: "", eof: true });
       }
       if (url.pathname.endsWith("/execs")) return send(200, { execs: [scene.job] });
+      (scene.gets ??= []).push(url.pathname);
       return send(200, scene.getJob ?? scene.job);
     });
   });
@@ -187,6 +189,31 @@ describe("start semantics", () => {
     assert.equal(job.id, scene.job.exec_id);
     assert.equal(job.state, "running");
     assert.equal((scene.starts ?? []).length, 1);
+  });
+
+  it("too_many_execs is not recovered by GET", async () => {
+    const { APIError } = await import("../dist/index.js");
+    scene.startStatus = 409;
+    scene.startBody = {
+      code: "too_many_execs",
+      detail: "the machine is already running its maximum number of concurrent commands",
+    };
+    scene.job = jobRec("running");
+    const sb = await newSandbox();
+    await assert.rejects(() => sb.start("echo hi"), (err) => {
+      assert.ok(err instanceof APIError);
+      assert.equal(err.code, "too_many_execs");
+      return true;
+    });
+    assert.equal((scene.gets ?? []).length, 0);
+  });
+
+  it("start sends env only when set", async () => {
+    scene.job = jobRec("running");
+    const sb = await newSandbox();
+    await sb.start("echo hi", 120, { env: { FOO: "bar" } });
+    assert.deepEqual(scene.startBodies[0].env, { FOO: "bar" });
+    assert.equal(scene.startBodies[0].cwd, undefined);
   });
 
   it("run() polls the minted id when start is unconfirmed", async () => {

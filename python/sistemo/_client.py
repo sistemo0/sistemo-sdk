@@ -10,10 +10,61 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Mapping
 
 from ._version import __version__
 from .errors import APIError, SistemoError, api_error
+
+# Honour Retry-After, but never sleep more than a minute on a single retry.
+_RETRY_AFTER_CAP = 60.0
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    """Seconds from a Retry-After header (delta-seconds or HTTP-date), capped at 60.
+
+    ``None`` when the header is missing or unparseable. A date in the past is 0.
+    """
+    if not value:
+        return None
+    text = value.strip()
+    try:
+        secs = int(text)
+    except ValueError:
+        secs = None
+    if secs is not None:
+        if secs < 0:
+            return None
+        return float(min(secs, int(_RETRY_AFTER_CAP)))
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delay = (dt - datetime.now(timezone.utc)).total_seconds()
+        if delay < 0:
+            return 0.0
+        return float(min(delay, _RETRY_AFTER_CAP))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def retry_delay(
+    attempt: int,
+    backoff: float,
+    max_backoff: float,
+    err: APIError | None = None,
+    rng=random.random,
+) -> float:
+    """Seconds to wait before the next attempt. Tests pass ``rng`` so they do not sleep."""
+    base = min(max_backoff, backoff * (2**attempt))
+    delay = base * (0.5 + rng())
+    if err is not None and err.status == 429:
+        if err.retry_after is None:
+            delay = max(delay, min(max_backoff, base))
+        else:
+            delay = min(max(delay, err.retry_after), _RETRY_AFTER_CAP)
+    return delay
 
 DEFAULT_BASE_URL = "https://api.sistemo.io"
 
@@ -59,6 +110,7 @@ class Client:
         self.max_retries = max(0, max_retries)
         self.retry_backoff = retry_backoff
         self.retry_max_backoff = retry_max_backoff
+        self.last_request_id: str | None = None
 
     def request(
         self,
@@ -78,11 +130,21 @@ class Client:
         retries = self.max_retries if max_retries is None else max(0, max_retries)
         method_u = method.upper()
         last_err: BaseException | None = None
+        hdrs = dict(headers or {})
+        req_id = None
+        for k, v in hdrs.items():
+            if k.lower() == "x-request-id" and v:
+                req_id = v
+                break
+        if not req_id:
+            req_id = str(uuid.uuid4())
+            hdrs["X-Request-Id"] = req_id
+        self.last_request_id = req_id
 
         for attempt in range(retries + 1):
             try:
                 return self._once(
-                    method_u, path, body, headers=headers, idempotency_key=idempotency_key
+                    method_u, path, body, headers=hdrs, idempotency_key=idempotency_key
                 )
             except APIError as e:
                 last_err = e
@@ -138,8 +200,23 @@ class Client:
                 code = parsed.get("code")
             except Exception:
                 parsed = None
+            retry_after = parse_retry_after(
+                e.headers.get("Retry-After") if e.headers else None
+            )
+            request_id = None
+            if isinstance(parsed, dict):
+                request_id = parsed.get("request_id")
+            if not request_id and e.headers:
+                request_id = e.headers.get("X-Request-Id")
+            if not request_id:
+                request_id = self.last_request_id
             raise api_error(
-                e.code, detail, code, parsed if isinstance(parsed, dict) else None
+                e.code,
+                detail,
+                code,
+                parsed if isinstance(parsed, dict) else None,
+                retry_after=retry_after,
+                request_id=str(request_id) if request_id else None,
             ) from None
         except urllib.error.URLError as e:
             raise SistemoError(f"connection error: {e.reason}") from e
@@ -163,12 +240,9 @@ class Client:
         return bool(idempotency_key)
 
     def _sleep(self, attempt: int, err: APIError | None) -> None:
-        # Exponential backoff + jitter. Honour Retry-After seconds if present later.
-        base = min(self.retry_max_backoff, self.retry_backoff * (2**attempt))
-        delay = base * (0.5 + random.random())  # full jitter around [0.5x, 1.5x]
-        if err is not None and err.status == 429:
-            delay = max(delay, min(self.retry_max_backoff, base))
-        time.sleep(delay)
+        time.sleep(
+            retry_delay(attempt, self.retry_backoff, self.retry_max_backoff, err)
+        )
 
     # --- volumes (incl. detachable root volumes) ---------------------------
 

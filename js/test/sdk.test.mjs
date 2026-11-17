@@ -15,6 +15,8 @@ import {
   RateLimitError,
   Sandbox,
   SistemoError,
+  parseRetryAfter,
+  retryDelayMs,
 } from "../dist/index.js";
 
 const state = {
@@ -43,11 +45,15 @@ function readBody(req) {
   });
 }
 
-function send(res, status, body) {
+function send(res, status, body, extraHeaders, reqId) {
+  if (body && typeof body === "object" && reqId && body.request_id == null) {
+    body = { ...body, request_id: reqId };
+  }
   const raw = body === undefined ? "" : JSON.stringify(body);
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(raw),
+    ...(extraHeaders || {}),
   });
   res.end(raw);
 }
@@ -65,18 +71,19 @@ before(async () => {
     const auth = req.headers.authorization || "";
     const ua = req.headers["user-agent"] || "";
     const idem = req.headers["idempotency-key"] || "";
-    state.log.push({ method, path, fullPath, body, auth, ua: String(ua), idem: String(idem) });
+    const reqId = req.headers["x-request-id"] || "";
+    state.log.push({ method, path, fullPath, body, auth, ua: String(ua), idem: String(idem), reqId: String(reqId) });
 
     if (state.failQueue.length) {
       const f = state.failQueue.shift();
-      send(res, f.status, f.body);
+      send(res, f.status, f.body, f.headers, reqId);
       return;
     }
 
     if (state.failNext) {
       const f = state.failNext;
       state.failNext = null;
-      send(res, f.status, f.body);
+      send(res, f.status, f.body, f.headers, reqId);
       return;
     }
 
@@ -376,6 +383,82 @@ describe("Sandbox", () => {
     ];
     await assert.rejects(() => sb.run("echo once"), (e) => e.status === 503);
     assert.equal(state.log.filter((l) => l.path.endsWith("/execs")).length, 1);
+  });
+
+  it("run sends env and cwd only when set", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    await sb.run("echo hi", 120, { env: { FOO: "bar" }, cwd: "/tmp" });
+    const withOpts = state.log.find((l) => l.path.endsWith("/execs") && l.method === "POST");
+    assert.deepEqual(withOpts.body.env, { FOO: "bar" });
+    assert.equal(withOpts.body.cwd, "/tmp");
+
+    state.log = [];
+    await sb.run("echo hi");
+    const bare = state.log.find((l) => l.path.endsWith("/execs") && l.method === "POST");
+    assert.equal(bare.body.env, undefined);
+    assert.equal(bare.body.cwd, undefined);
+  });
+});
+
+describe("request id and Retry-After", () => {
+  it("every request sends X-Request-Id", async () => {
+    const c = new Client({ apiKey: "k", baseUrl });
+    await c.request("GET", "/v1/volumes");
+    assert.ok(state.log.at(-1).reqId);
+    assert.equal(c.lastRequestId, state.log.at(-1).reqId);
+  });
+
+  it("an error carries requestId", async () => {
+    const c = new Client({ apiKey: "k", baseUrl, maxRetries: 0 });
+    state.failNext = { status: 500, body: { detail: "boom" } };
+    await assert.rejects(() => c.request("GET", "/v1/volumes"), (err) => {
+      assert.ok(err.requestId);
+      assert.equal(err.requestId, c.lastRequestId);
+      return true;
+    });
+  });
+
+  it("retries reuse the same request id", async () => {
+    const c = new Client({ apiKey: "k", baseUrl, maxRetries: 2, retryBackoffMs: 5 });
+    state.failQueue = [
+      { status: 503, body: { detail: "busy" } },
+      { status: 503, body: { detail: "still busy" } },
+    ];
+    await c.listVolumes();
+    const ids = state.log.filter((l) => l.path === "/v1/volumes").map((l) => l.reqId);
+    assert.equal(ids.length, 3);
+    assert.equal(new Set(ids).size, 1);
+  });
+
+  it("close retries 429 honouring Retry-After", async () => {
+    const client = new Client({ apiKey: "k", baseUrl, retryBackoffMs: 5 });
+    const sb = await Sandbox.create({ client });
+    state.failQueue = [
+      {
+        status: 429,
+        body: { detail: "slow", code: "rate_limited" },
+        headers: { "Retry-After": "0" },
+      },
+    ];
+    await sb.close();
+    const deletes = state.log.filter(
+      (l) => l.method === "DELETE" && l.path.startsWith("/v1/machines/"),
+    );
+    assert.equal(deletes.length, 2);
+  });
+
+  it("retryDelayMs honours Retry-After above the 8s backoff cap", () => {
+    const err = new RateLimitError(429, "slow", "rate_limited", {}, { retryAfter: 12 });
+    const d = retryDelayMs(0, 10, 8000, err, () => 0.5);
+    assert.ok(d >= 12_000, `delay ${d} must be at least Retry-After 12s`);
+    assert.ok(d <= 60_000, `delay ${d} must cap at 60s`);
+  });
+
+  it("parseRetryAfter caps at 60 and rejects junk", () => {
+    assert.equal(parseRetryAfter("999"), 60);
+    assert.equal(parseRetryAfter("12"), 12);
+    assert.equal(parseRetryAfter("nope"), undefined);
+    assert.equal(parseRetryAfter("-1"), undefined);
   });
 });
 

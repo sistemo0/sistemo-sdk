@@ -61,11 +61,19 @@ class _MockAPI(BaseHTTPRequestHandler):
             return None
         return json.loads(self.rfile.read(n))
 
-    def _send(self, status: int, body: Any = None) -> None:
+    def _send(self, status: int, body: Any = None, extra_headers: dict | None = None) -> None:
+        if isinstance(body, dict):
+            body = dict(body)
+            rid = self.headers.get("X-Request-Id")
+            if rid and "request_id" not in body:
+                body["request_id"] = rid
         raw = b"" if body is None else json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, str(v))
         self.end_headers()
         if raw:
             self.wfile.write(raw)
@@ -95,18 +103,27 @@ class _MockAPI(BaseHTTPRequestHandler):
                 "auth": auth,
                 "ua": ua,
                 "idem": idem,
+                "req_id": self.headers.get("X-Request-Id", ""),
             }
         )
 
         if _MockAPI.fail_queue:
             fail = _MockAPI.fail_queue.pop(0)
-            self._send(fail["status"], fail.get("body", {"detail": "failed"}))
+            self._send(
+                fail["status"],
+                fail.get("body", {"detail": "failed"}),
+                fail.get("headers"),
+            )
             return
 
         if _MockAPI.fail_next is not None:
             fail = _MockAPI.fail_next
             _MockAPI.fail_next = None
-            self._send(fail["status"], fail.get("body", {"detail": "failed"}))
+            self._send(
+                fail["status"],
+                fail.get("body", {"detail": "failed"}),
+                fail.get("headers"),
+            )
             return
 
         if not auth.startswith("Bearer "):
@@ -423,6 +440,79 @@ class SDKTest(unittest.TestCase):
         self.assertEqual(creates[1]["idem"], "create-once")
         self.assertEqual(len(_MockAPI.machines), 1)
         self.assertEqual(sb.id, "m-1")
+
+    def test_run_sends_env_and_cwd(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        sb.run("echo hi", env={"FOO": "bar"}, cwd="/tmp")
+        execs = [x for x in _MockAPI.log if x["path"].endswith("/execs") and x["method"] == "POST"]
+        self.assertEqual(len(execs), 1)
+        self.assertEqual(execs[0]["body"]["env"], {"FOO": "bar"})
+        self.assertEqual(execs[0]["body"]["cwd"], "/tmp")
+
+    def test_run_omits_env_when_unset(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        sb.run("echo hi")
+        execs = [x for x in _MockAPI.log if x["path"].endswith("/execs") and x["method"] == "POST"]
+        self.assertEqual(len(execs), 1)
+        self.assertNotIn("env", execs[0]["body"])
+        self.assertNotIn("cwd", execs[0]["body"])
+
+    def test_every_request_sends_request_id(self) -> None:
+        c = Client(api_key="k", base_url=self.base)
+        c.request("GET", "/v1/volumes")
+        self.assertTrue(_MockAPI.log[-1]["req_id"])
+        self.assertEqual(c.last_request_id, _MockAPI.log[-1]["req_id"])
+
+    def test_error_carries_request_id(self) -> None:
+        c = Client(api_key="k", base_url=self.base, max_retries=0)
+        _MockAPI.fail_next = {"status": 500, "body": {"detail": "boom"}}
+        with self.assertRaises(APIError) as cm:
+            c.request("GET", "/v1/volumes")
+        self.assertTrue(cm.exception.request_id)
+        self.assertEqual(cm.exception.request_id, c.last_request_id)
+
+    def test_retries_reuse_the_same_request_id(self) -> None:
+        c = Client(api_key="k", base_url=self.base, max_retries=2, retry_backoff=0.01)
+        _MockAPI.fail_queue = [
+            {"status": 503, "body": {"detail": "busy"}},
+            {"status": 503, "body": {"detail": "still busy"}},
+        ]
+        c.list_volumes()
+        ids = [x["req_id"] for x in _MockAPI.log if x["path"] == "/v1/volumes"]
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(len(set(ids)), 1)
+
+    def test_close_retries_429(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.fail_queue = [
+            {
+                "status": 429,
+                "body": {"detail": "slow", "code": "rate_limited"},
+                "headers": {"Retry-After": "0"},
+            }
+        ]
+        sb.close()
+        deletes = [
+            x for x in _MockAPI.log if x["method"] == "DELETE" and x["path"].startswith("/v1/machines/")
+        ]
+        self.assertEqual(len(deletes), 2)
+
+    def test_retry_delay_honours_retry_after(self) -> None:
+        from sistemo._client import retry_delay
+        from sistemo.errors import RateLimitError
+
+        err = RateLimitError(429, "slow", "rate_limited", retry_after=12)
+        d = retry_delay(0, 0.01, 8.0, err, rng=lambda: 0.5)
+        self.assertGreaterEqual(d, 12)
+        self.assertLessEqual(d, 60)
+
+    def test_retry_after_cap_is_60(self) -> None:
+        from sistemo._client import parse_retry_after
+
+        self.assertEqual(parse_retry_after("999"), 60)
+        self.assertEqual(parse_retry_after("12"), 12)
+        self.assertIsNone(parse_retry_after("nope"))
+        self.assertEqual(parse_retry_after("-1"), None)
 
 
 if __name__ == "__main__":
