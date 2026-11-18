@@ -21,6 +21,7 @@ import {
   Sandbox,
   SistemoError,
   TooManyExecsError,
+  ExecStartUnconfirmed,
   parseRetryAfter,
   retryDelayMs,
 } from "../dist/index.js";
@@ -34,9 +35,30 @@ const state = {
   volumesNull: false,
   paginate: false,
   dropCount: 0,
+  dropStoreExec: false,
   jobs: new Map(),
   jobGone: null,
+  outputGone: null,
 };
+
+function acceptExec(path, body) {
+  const id = path.split("/")[3];
+  const script = body?.script || "";
+  const eid = body?.exec_id || "e-1";
+  const rec = {
+    exec_id: eid,
+    machine_id: id,
+    state: "succeeded",
+    exit_code: script.includes("fail") ? 1 : 0,
+    truncated: false,
+  };
+  if (state.jobGone) {
+    rec.state = "running";
+    rec.exit_code = null;
+  }
+  state.jobs.set(eid, { rec, stdout: Buffer.from(`out:${script}`) });
+  return rec;
+}
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -80,10 +102,18 @@ before(async () => {
     const ua = req.headers["user-agent"] || "";
     const idem = req.headers["idempotency-key"] || "";
     const reqId = req.headers["x-request-id"] || "";
-    // Drop BEFORE reading the body. A POST whose body is already consumed then
-    // destroyed waits on undici's headersTimeout (the client's timeoutMs).
+    // Drop BEFORE reading the body, except dropStoreExec: the guest accepted
+    // the POST and the ACK was lost, so we must read+store then destroy.
+    // Destroy-after-read waits on undici headersTimeout (the client's timeoutMs).
     if (state.dropCount > 0) {
       state.dropCount -= 1;
+      if (state.dropStoreExec && method === "POST" && path.endsWith("/execs")) {
+        const stored = await readBody(req);
+        state.log.push({ method, path, fullPath, body: stored, auth, ua: String(ua), idem: String(idem), reqId: String(reqId) });
+        acceptExec(path, stored);
+        req.destroy();
+        return;
+      }
       state.log.push({ method, path, fullPath, body: undefined, auth, ua: String(ua), idem: String(idem), reqId: String(reqId) });
       req.destroy();
       return;
@@ -106,6 +136,11 @@ before(async () => {
 
     if (state.jobGone && method === "GET" && path.includes("/execs/")) {
       send(res, state.jobGone.status, state.jobGone.body, undefined, reqId);
+      return;
+    }
+
+    if (state.outputGone && method === "GET" && path.endsWith("/output")) {
+      send(res, state.outputGone.status, state.outputGone.body, undefined, reqId);
       return;
     }
 
@@ -134,21 +169,7 @@ before(async () => {
         send(res, 404, { detail: "not found" });
         return;
       }
-      const script = body?.script || "";
-      const eid = body?.exec_id || "e-1";
-      const rec = {
-        exec_id: eid,
-        machine_id: id,
-        state: "succeeded",
-        exit_code: script.includes("fail") ? 1 : 0,
-        truncated: false,
-      };
-      if (state.jobGone) {
-        rec.state = "running";
-        rec.exit_code = null;
-      }
-      state.jobs.set(eid, { rec, stdout: Buffer.from(`out:${script}`) });
-      send(res, 202, rec);
+      send(res, 202, acceptExec(path, body));
       return;
     }
 
@@ -277,8 +298,10 @@ beforeEach(() => {
   state.volumesNull = false;
   state.paginate = false;
   state.dropCount = 0;
+  state.dropStoreExec = false;
   state.jobs.clear();
   state.jobGone = null;
+  state.outputGone = null;
   delete process.env.SISTEMO_API_KEY;
   delete process.env.SISTEMO_BASE_URL;
 });
@@ -609,6 +632,47 @@ describe("Sandbox", () => {
     });
     const execs = state.log.filter((l) => l.method === "POST" && l.path.endsWith("/execs"));
     assert.equal(execs.length, 1);
+  });
+
+  it("run() recovers a dropped start by exec_id", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl, timeoutMs: 500 });
+    state.log = [];
+    state.dropStoreExec = true;
+    state.dropCount = 1;
+    const r = await sb.run("echo recovered");
+    assert.equal(r.ok, true);
+    assert.match(r.stdout, /echo recovered/);
+    assert.equal(r.lost, false);
+    const posts = state.log.filter((l) => l.method === "POST" && l.path.endsWith("/execs"));
+    assert.equal(posts.length, 1);
+    assert.ok(
+      state.log.some((l) => l.method === "GET" && l.path.includes("/execs/")),
+      "a dropped start must GET the minted exec_id",
+    );
+  });
+
+  it("dropped start raises ExecStartUnconfirmed when GET also fails", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl, timeoutMs: 500, maxRetries: 0 });
+    state.log = [];
+    state.dropStoreExec = true;
+    state.dropCount = 2;
+    await assert.rejects(() => sb.start("echo hi"), (e) => {
+      assert.ok(e instanceof ExecStartUnconfirmed);
+      assert.ok(e.execId);
+      return true;
+    });
+    const posts = state.log.filter((l) => l.method === "POST" && l.path.endsWith("/execs"));
+    assert.equal(posts.length, 1);
+  });
+
+  it("run() succeeded + output 404 is empty, not lost", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.outputGone = { status: 404, body: { code: "not_found", detail: "gone" } };
+    const r = await sb.run("echo hi");
+    assert.equal(r.lost, false);
+    assert.equal(r.ok, true);
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.stdout, "");
   });
 
   it("run() lost when the machine stops mid-wait", async () => {

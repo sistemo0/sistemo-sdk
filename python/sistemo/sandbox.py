@@ -7,8 +7,19 @@ from dataclasses import dataclass
 from typing import Iterator
 
 from ._client import Client, Page, _qs
-from .errors import APIError, SistemoError
+from .errors import APIError, ExecStartUnconfirmed, NotFoundError, SistemoError
 from .jobs import Job
+
+# 409s that mean the POST did not start this id. GET would 404 a fresh UUID.
+_SKIP_GET_409 = frozenset(
+    {
+        "too_many_execs",
+        "machine_process_limit",
+        "machine_disk_full",
+        "machine_out_of_memory",
+        "machine_not_running",
+    }
+)
 
 
 @dataclass
@@ -144,17 +155,19 @@ class Sandbox:
 
         ``env`` and ``cwd`` are sent only when set, so option-less starts still
         work on older guest agents. HTTP 5xx/429 and dropped connections on
-        start are **not** retried (replaying would re-run the script). If start
-        is unconfirmed, this still waits on the id we minted. If the machine
-        stops while waiting, this returns ``lost=True`` rather than raising 409.
+        start are **not** retried (replaying would re-run the script). A dropped
+        start is recovered by GET of the minted id. If start is unconfirmed,
+        this still waits on that id. If the machine stops while waiting, this
+        returns ``lost=True`` rather than raising 409.
         """
-        from .errors import ExecStartUnconfirmed
-
         eid = str(uuid.uuid4())
         try:
             job = self.start(script, timeout=timeout, exec_id=eid, env=env, cwd=cwd)
-        except ExecStartUnconfirmed:
-            job = self.job(eid)
+        except ExecStartUnconfirmed as e:
+            try:
+                job = self.job(eid)
+            except SistemoError:
+                raise e from None
         job.wait()
         # ⚠ -1 is a placeholder for "unknown", not a real status. `lost` is what
         # carries that fact; exit_code alone cannot, because -1 is also a status
@@ -191,10 +204,9 @@ class Sandbox:
 
         ⚠ If this raises :class:`~sistemo.errors.ExecStartUnconfirmed`, the
         command **may be running**. The exception carries ``exec_id``; poll it
-        with :meth:`job` rather than starting over.
+        with :meth:`job` rather than starting over. A dropped connection on
+        POST is recovered the same way: GET that id, never re-POST.
         """
-        from .errors import NotFoundError
-
         eid = exec_id or str(uuid.uuid4())
         body: dict = {"exec_id": eid, "script": script, "timeout_sec": timeout}
         if env:
@@ -210,22 +222,39 @@ class Sandbox:
             )
         except APIError as e:
             if e.status == 409:
-                if e.code in (
-                    "too_many_execs",
-                    "machine_process_limit",
-                    "machine_disk_full",
-                    "machine_out_of_memory",
-                    "machine_not_running",
-                ):
+                if e.code in _SKIP_GET_409:
                     raise
-                try:
-                    rec = self._client.request(
-                        "GET", f"/v1/machines/{self.id}/execs/{eid}"
-                    )
-                except NotFoundError:
-                    raise e from None
-            else:
-                raise
+                return self._job_after_unconfirmed_start(eid, e)
+            raise
+        except SistemoError as e:
+            # Connection / timeout / invalid JSON. The POST is not retried
+            # (no Idempotency-Key); the minted id is how we find out whether
+            # the guest accepted it.
+            return self._job_after_unconfirmed_start(eid, e)
+        return Job(self, rec)
+
+    def _job_after_unconfirmed_start(
+        self, eid: str, original: BaseException
+    ) -> Job:
+        """GET the minted id after a POST whose outcome we cannot trust.
+
+        Found → that job. 404 → the original error (nothing started). Any
+        other GET failure → :class:`ExecStartUnconfirmed` so the caller has
+        the handle.
+        """
+        try:
+            rec = self._client.request(
+                "GET", f"/v1/machines/{self.id}/execs/{eid}"
+            )
+        except NotFoundError:
+            raise original from None
+        except SistemoError:
+            raise ExecStartUnconfirmed(
+                503,
+                "connection dropped while starting; the command may be running",
+                None,
+                {"exec_id": eid},
+            ) from original
         return Job(self, rec)
 
     def job(self, exec_id: str) -> Job:

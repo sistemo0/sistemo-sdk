@@ -35,6 +35,7 @@ from sistemo import (
     AuthError,
     Client,
     ExecResult,
+    ExecStartUnconfirmed,
     MachineNotRunningError,
     NotFoundError,
     RateLimitError,
@@ -63,9 +64,31 @@ class _MockAPI(BaseHTTPRequestHandler):
     paginate: bool = False
     # Close without a byte of HTTP this many times (RemoteDisconnected).
     drop_count: int = 0
+    # When dropping a POST /execs, still store the job (response lost, guest accepted).
+    drop_store_exec: bool = False
     jobs: dict[str, dict] = {}
     # Sticky GET failure for /execs/{id} and /output (machine stopped mid-wait).
     job_gone: dict[str, Any] | None = None
+    # Sticky GET failure for /output only (command already succeeded).
+    output_gone: dict[str, Any] | None = None
+
+    @staticmethod
+    def _accept_exec(path: str, body: Any) -> dict:
+        mid = path.split("/")[3]
+        script = (body or {}).get("script", "")
+        eid = (body or {}).get("exec_id") or "e-1"
+        rec = {
+            "exec_id": eid,
+            "machine_id": mid,
+            "state": "succeeded",
+            "exit_code": 0 if "fail" not in script else 1,
+            "truncated": False,
+        }
+        if _MockAPI.job_gone is not None:
+            rec["state"] = "running"
+            rec["exit_code"] = None
+        _MockAPI.jobs[eid] = {"rec": rec, "stdout": f"out:{script}".encode()}
+        return rec
 
     def log_message(self, format: str, *args) -> None:  # quiet
         return
@@ -124,6 +147,12 @@ class _MockAPI(BaseHTTPRequestHandler):
 
         if _MockAPI.drop_count > 0:
             _MockAPI.drop_count -= 1
+            if (
+                _MockAPI.drop_store_exec
+                and method == "POST"
+                and path.endswith("/execs")
+            ):
+                _MockAPI._accept_exec(path, body)
             self.close_connection = True
             try:
                 self.connection.close()
@@ -159,6 +188,15 @@ class _MockAPI(BaseHTTPRequestHandler):
             self._send(fail["status"], fail.get("body", {"detail": "gone"}))
             return
 
+        if (
+            _MockAPI.output_gone is not None
+            and method == "GET"
+            and path.endswith("/output")
+        ):
+            fail = _MockAPI.output_gone
+            self._send(fail["status"], fail.get("body", {"detail": "gone"}))
+            return
+
         if not auth.startswith("Bearer "):
             self._send(401, {"detail": "missing key", "code": "unauthorized"})
             return
@@ -181,19 +219,7 @@ class _MockAPI(BaseHTTPRequestHandler):
             if mid not in _MockAPI.machines:
                 self._send(404, {"detail": "not found", "code": "not_found"})
                 return
-            script = (body or {}).get("script", "")
-            eid = (body or {}).get("exec_id") or "e-1"
-            rec = {
-                "exec_id": eid,
-                "machine_id": mid,
-                "state": "succeeded",
-                "exit_code": 0 if "fail" not in script else 1,
-                "truncated": False,
-            }
-            if _MockAPI.job_gone is not None:
-                rec["state"] = "running"
-                rec["exit_code"] = None
-            _MockAPI.jobs[eid] = {"rec": rec, "stdout": f"out:{script}".encode()}
+            rec = _MockAPI._accept_exec(path, body)
             self._send(202, rec)
             return
 
@@ -367,8 +393,10 @@ class SDKTest(unittest.TestCase):
         _MockAPI.volumes_null = False
         _MockAPI.paginate = False
         _MockAPI.drop_count = 0
+        _MockAPI.drop_store_exec = False
         _MockAPI.jobs.clear()
         _MockAPI.job_gone = None
+        _MockAPI.output_gone = None
         # isolate env
         self._env = os.environ.copy()
         os.environ.pop("SISTEMO_API_KEY", None)
@@ -744,6 +772,61 @@ class SDKTest(unittest.TestCase):
             if x["method"] == "POST" and x["path"].endswith("/execs")
         ]
         self.assertEqual(len(execs), 1)
+
+    def test_run_recovers_dropped_start_by_exec_id(self) -> None:
+        """The guest accepted the POST; the ACK was lost. GET that id, never re-POST."""
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.log.clear()
+        _MockAPI.drop_store_exec = True
+        _MockAPI.drop_count = 1
+        r = sb.run("echo recovered")
+        self.assertTrue(r.ok)
+        self.assertIn("echo recovered", r.stdout)
+        self.assertFalse(r.lost)
+        posts = [
+            x
+            for x in _MockAPI.log
+            if x["method"] == "POST" and x["path"].endswith("/execs")
+        ]
+        self.assertEqual(len(posts), 1)
+        self.assertTrue(
+            any(
+                x["method"] == "GET" and "/execs/" in x["path"]
+                for x in _MockAPI.log
+            ),
+            "a dropped start must GET the minted exec_id",
+        )
+
+    def test_dropped_start_raises_unconfirmed_when_get_also_fails(self) -> None:
+        """If GET cannot tell either, the error still carries exec_id."""
+        sb = Sandbox(
+            client=Client(api_key="k", base_url=self.base, max_retries=0)
+        )
+        _MockAPI.log.clear()
+        _MockAPI.drop_store_exec = True
+        _MockAPI.drop_count = 2
+        with self.assertRaises(ExecStartUnconfirmed) as cm:
+            sb.start("echo hi")
+        self.assertTrue(cm.exception.exec_id)
+        posts = [
+            x
+            for x in _MockAPI.log
+            if x["method"] == "POST" and x["path"].endswith("/execs")
+        ]
+        self.assertEqual(len(posts), 1)
+
+    def test_run_succeeded_output_404_is_empty_not_lost(self) -> None:
+        """A command that already succeeded is not rewritten to lost because logs 404."""
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.output_gone = {
+            "status": 404,
+            "body": {"code": "not_found", "detail": "gone"},
+        }
+        r = sb.run("echo hi")
+        self.assertFalse(r.lost)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.exit_code, 0)
+        self.assertEqual(r.stdout, "")
 
     def test_post_without_idempotency_is_not_retried_on_drop(self) -> None:
         """Counter-guard for _retry_safe itself — start() also sets max_retries=0.

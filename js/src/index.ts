@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.1.5";
+const USER_AGENT = "@sistemo/sdk/0.1.6";
 
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -679,8 +679,9 @@ export class Sandbox {
    *
    * This is start + wait on a guest job (`POST /execs`). Default timeout 120s,
    * ceiling 24 hours. A proxy never holds the connection for the whole command.
-   * HTTP 5xx/429 and dropped connections on start are not retried. If the
-   * machine stops while waiting, this returns `lost: true` rather than throwing 409.
+   * HTTP 5xx/429 and dropped connections on start are not retried. A dropped
+   * start is recovered by GET of the minted id. If the machine stops while
+   * waiting, this returns `lost: true` rather than throwing 409.
    */
   async run(
     script: string,
@@ -693,7 +694,11 @@ export class Sandbox {
       job = await this.start(script, timeoutSec, { execId, ...opts });
     } catch (e) {
       if (e instanceof ExecStartUnconfirmed) {
-        job = await this.job(execId);
+        try {
+          job = await this.job(execId);
+        } catch {
+          throw e;
+        }
       } else {
         throw e;
       }
@@ -702,13 +707,17 @@ export class Sandbox {
     const dec = new TextDecoder("utf-8");
     // ⚠ -1 is a placeholder for "unknown", not a real status. `lost` is what
     // carries that fact; exitCode alone cannot, because -1 is also a status a
-    // real command can exit with.
+    // real command can exit with. Read output BEFORE snapshotting `lost`:
+    // output() may still mark the job lost, and capturing first made JS report
+    // ok with empty stdout while Python reported lost.
+    const stdout = dec.decode(await job.output("stdout"));
+    const stderr = dec.decode(await job.output("stderr"));
     const exitCode = job.exitCode ?? -1;
     const lost = job.lost;
     return {
       exitCode,
-      stdout: dec.decode(await job.output("stdout")),
-      stderr: dec.decode(await job.output("stderr")),
+      stdout,
+      stderr,
       truncated: job.truncated,
       requestId: job.requestId,
       lost,
@@ -728,7 +737,9 @@ export class Sandbox {
    * {@link TooManyExecsError}: wait for a command to finish.
    *
    * ⚠ On {@link ExecStartUnconfirmed} the command **may be running**. The error
-   * carries `execId`; poll it with {@link job} rather than starting over.
+   * carries `execId`; poll it with {@link job} rather than starting over. A
+   * dropped connection on POST is recovered the same way: GET that id, never
+   * re-POST.
    */
   async start(
     script: string,
@@ -758,18 +769,36 @@ export class Sandbox {
         ) {
           throw e;
         }
-        try {
-          const rec = await this.client.request<JobRecord>(
-            "GET",
-            `/v1/machines/${this.id}/execs/${execId}`,
-          );
-          return new Job(this.client, this.id, rec);
-        } catch (inner) {
-          if (inner instanceof NotFoundError) throw e;
-          throw inner;
-        }
+        return this.jobAfterUnconfirmedStart(execId, e);
+      }
+      if (e instanceof SistemoError && !(e instanceof APIError)) {
+        return this.jobAfterUnconfirmedStart(execId, e);
       }
       throw e;
+    }
+  }
+
+  /**
+   * GET the minted id after a POST whose outcome we cannot trust.
+   *
+   * Found → that job. 404 → the original error (nothing started). Any other
+   * GET failure → {@link ExecStartUnconfirmed} so the caller has the handle.
+   */
+  private async jobAfterUnconfirmedStart(execId: string, original: unknown): Promise<Job> {
+    try {
+      const rec = await this.client.request<JobRecord>(
+        "GET",
+        `/v1/machines/${this.id}/execs/${execId}`,
+      );
+      return new Job(this.client, this.id, rec);
+    } catch (inner) {
+      if (inner instanceof NotFoundError) throw original;
+      throw new ExecStartUnconfirmed(
+        503,
+        "connection dropped while starting; the command may be running",
+        undefined,
+        { exec_id: execId },
+      );
     }
   }
 
@@ -822,6 +851,9 @@ export class Sandbox {
 
 /** States that mean nothing further will happen. */
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "expired", "lost"]);
+/** Terminal states where we already know what the command did. An output
+ * 404 after one of these is empty bytes, not a rewrite to `lost`. */
+const KNOWN_OUTCOME = new Set(["succeeded", "failed", "cancelled", "expired"]);
 
 interface JobRecord {
   exec_id?: string;
@@ -1021,7 +1053,7 @@ export class Job {
         );
       } catch (e) {
         if (jobUnaccountable(e)) {
-          this.markLost();
+          if (!KNOWN_OUTCOME.has(this.state)) this.markLost();
           return;
         }
         throw e;
@@ -1083,7 +1115,7 @@ export class Job {
         );
       } catch (e) {
         if (jobUnaccountable(e)) {
-          this.markLost();
+          if (!KNOWN_OUTCOME.has(this.state)) this.markLost();
           break;
         }
         throw e;

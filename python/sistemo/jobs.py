@@ -27,6 +27,9 @@ if TYPE_CHECKING:  # pragma: no cover
 
 #: States that mean nothing further will happen.
 TERMINAL = frozenset({"succeeded", "failed", "cancelled", "expired", "lost"})
+#: Terminal states where we already know what the command did. An output
+#: 404 after one of these is empty bytes, not a rewrite to ``lost``.
+_KNOWN_OUTCOME = frozenset({"succeeded", "failed", "cancelled", "expired"})
 
 
 class JobTimeout(SistemoError):
@@ -192,7 +195,8 @@ class Job:
                 )
             except APIError as e:
                 if _unaccountable(e):
-                    self._mark_lost()
+                    if self.state not in _KNOWN_OUTCOME:
+                        self._mark_lost()
                     return
                 raise
             offset = int(page.get("next_offset") or offset)
@@ -251,7 +255,8 @@ class Job:
                 )
             except APIError as e:
                 if _unaccountable(e):
-                    self._mark_lost()
+                    if self.state not in _KNOWN_OUTCOME:
+                        self._mark_lost()
                     return bytes(buf)
                 raise
             raw = page.get("data") or ""

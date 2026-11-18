@@ -189,9 +189,15 @@ is a 409 and returns the existing job, not a second run. If start throws
 
 The 17th concurrent command is `TooManyExecsError` (`too_many_execs`): wait for
 one to finish; a new id does not help. `POST /execs` is never retried — not on
-HTTP 5xx/429, and not on a dropped connection.
+HTTP 5xx/429, and not on a dropped connection. A dropped start is recovered by
+GET of the minted id; if that GET also fails, `ExecStartUnconfirmed` carries it.
 
 ## Changelog
+
+### 0.1.6
+
+- A dropped `start()` / `run()` is recovered by GET of the minted `execId`, never by re-POSTing. If GET also fails, `ExecStartUnconfirmed` still carries the id.
+- After a command has already succeeded, unread output is empty stdout — not `lost: true`. `run()` now reads `lost` after fetching output, matching Python.
 
 ### 0.1.5
 
