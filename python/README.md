@@ -56,7 +56,7 @@ Or pass them explicitly: `Sandbox(api_key="sk_live_…", base_url="https://…")
 ```python
 sb = Sandbox(vcpus=1, memory_mb=1024, stack="base")  # provisions a microVM
 res = sb.run("echo hi && uname -a")                        # -> ExecResult (default 120s, max 24h)
-res.stdout, res.stderr, res.exit_code, res.ok, res.truncated, res.request_id
+res.stdout, res.stderr, res.exit_code, res.ok, res.truncated, res.request_id, res.lost
 sb.run("python3 app.py", env={"FOO": "bar"}, cwd="/tmp")   # env/cwd omitted unless set
 sb.close()                                                 # destroy (or use `with`)
 ```
@@ -66,7 +66,7 @@ A **read** API key can list resources but cannot create sandboxes or run code �
 ## Errors
 
 ```python
-from sistemo import APIError, AuthError, QuotaExceededError
+from sistemo import APIError, AuthError, InsufficientBalanceError, QuotaExceededError
 
 try:
     with Sandbox() as sb:
@@ -76,22 +76,43 @@ except QuotaExceededError as e:
     # use. Retrying SUCCEEDS once you free that resource — stop or destroy a
     # machine, delete a volume — or once the limit is raised.
     print(e.detail)
+except InsufficientBalanceError as e:
+    # Prepaid wallet cannot cover this. Top up; freeing machines does not help.
+    print(e.detail)
 except AuthError:
     ...          # 401/403 — key missing/invalid/revoked, or read-only key
 except APIError as e:
-    print(e.status, e.detail, e.code, e.request_id)
+    print(e.status, e.detail, e.code, e.request_id, e.retryable, e.doc_url)
 ```
 
 Both `QuotaExceededError` and `AuthError` arrive as HTTP 403, so **catch
 `QuotaExceededError` first** — it is a subclass of `APIError`, not of `AuthError`,
 precisely because the two need opposite handling: an auth failure never succeeds
 on retry, a quota refusal does once you free something. `GET /v1/quotas` reports
-every limit alongside current usage.
+every limit alongside current usage. `InsufficientBalanceError` is HTTP 402
+(top up); it is not a quota refusal and not an auth failure.
 
 Every request sends `X-Request-Id`. Quote `e.request_id` when you contact support.
 On `429`, the client honours `Retry-After` (capped at 60 s) from version 0.1.3.
+`e.retryable` and `e.doc_url` come from the API body when it sent them (`None` if it did not).
 
 Zero runtime dependencies (Python stdlib only). Apache-2.0.
+
+## List machines and volumes
+
+Lists are keyset-paginated. `list_volumes()` / `list_machines()` return a
+`Page` (a list with `next_cursor`; `None` means the last page). Index it like a
+list; walk every page with `iter_volumes()` / `iter_machines()`.
+
+```python
+from sistemo import Client
+
+c = Client()
+page = c.list_volumes()          # page[0]["id"], page.next_cursor
+page = c.list_volumes(cursor=page.next_cursor, limit=50)
+for vol in c.iter_volumes():
+    print(vol["id"])
+```
 
 ## Long-running commands
 
@@ -121,8 +142,17 @@ with Sandbox() as sb:
     print(result.state, result.exit_code)
 ```
 
-The handle outlives the process that created it, so a crashed client can
-reconnect with `sb.job(exec_id)` or list what is running with `sb.jobs()`.
+The handle outlives the process that created it. Reconnect with
+`Sandbox.connect(machine_id)` (does not provision a new microVM), then
+`sb.job(exec_id)` or `sb.jobs()` / `sb.iter_jobs()`. `jobs()` returns a `Page`
+(a list with `next_cursor`); the guest keeps at most 64, so the default page
+holds them all.
+
+```python
+sb = Sandbox.connect(machine_id)   # GET /v1/machines/{id}
+job = sb.job(exec_id)
+print(job.wait().exit_code)
+```
 
 ### Three things worth knowing
 

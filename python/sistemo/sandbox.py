@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from typing import Iterator
 
-from ._client import Client
-from .errors import APIError
+from ._client import Client, Page, _qs
+from .errors import APIError, SistemoError
 from .jobs import Job
 
 
@@ -19,10 +20,21 @@ class ExecResult:
     stderr: str
     truncated: bool = False
     request_id: str | None = None
+    #: The machine could not account for this command.
+    #:
+    #: ⚠ When this is true, :attr:`exit_code` is a PLACEHOLDER (-1) and means
+    #: nothing — we can say neither that the command ran nor that it did not.
+    #: Without this flag a machine that died mid-command was indistinguishable
+    #: from a command that genuinely exited -1.
+    lost: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0
+        """True only for a command that finished and exited 0.
+
+        A lost command is never ok — we do not know that it worked.
+        """
+        return self.exit_code == 0 and not self.lost
 
 
 class Sandbox:
@@ -83,6 +95,39 @@ class Sandbox:
         self.root_volume_id: str = root_volume_id
         self._create_idempotency_key = key
 
+    @classmethod
+    def connect(
+        cls,
+        machine_id: str,
+        *,
+        client: Client | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> "Sandbox":
+        """Re-attach to an existing machine — after a crash, or from a stored id.
+
+        Does **not** provision a new microVM. The machine must still exist
+        (a 404 is :class:`~sistemo.errors.NotFoundError`).
+        """
+        if not machine_id:
+            raise SistemoError("machine id is required")
+        c = client or Client(api_key=api_key, base_url=base_url)
+        rec = c.request("GET", f"/v1/machines/{machine_id}")
+        mid = rec.get("id") if isinstance(rec, dict) else None
+        if not mid:
+            raise APIError(
+                502,
+                "machine response missing id — refusing to continue",
+                code="invalid_machine_response",
+            )
+        self = object.__new__(cls)
+        self._client = c
+        self.id = str(mid)
+        self.state = str(rec.get("state", "") or "")
+        self.root_volume_id = str(rec.get("root_volume_id") or "")
+        self._create_idempotency_key = ""
+        return self
+
     def run(
         self,
         script: str,
@@ -110,6 +155,9 @@ class Sandbox:
         except ExecStartUnconfirmed:
             job = self.job(eid)
         job.wait()
+        # ⚠ -1 is a placeholder for "unknown", not a real status. `lost` is what
+        # carries that fact; exit_code alone cannot, because -1 is also a status
+        # a real command can exit with.
         code = -1 if job.exit_code is None else job.exit_code
         return ExecResult(
             exit_code=code,
@@ -117,6 +165,7 @@ class Sandbox:
             stderr=job.logs("stderr"),
             truncated=job.truncated,
             request_id=job.request_id,
+            lost=job.lost,
         )
 
     def start(
@@ -181,12 +230,34 @@ class Sandbox:
         rec = self._client.request("GET", f"/v1/machines/{self.id}/execs/{exec_id}")
         return Job(self, rec)
 
-    def jobs(self, limit: int = 50) -> list[Job]:
-        """List this sandbox's async jobs, newest first."""
+    def jobs(self, limit: int = 100, *, cursor: str | None = None) -> Page:
+        """List this sandbox's async jobs, newest first.
+
+        Returns a :class:`~sistemo.Page` of :class:`~sistemo.jobs.Job`. Index it
+        like a list; ``next_cursor`` is ``None`` on the last page. The guest
+        keeps at most 64, so the default page holds them all. Walk every page
+        with :meth:`iter_jobs`.
+        """
         out = self._client.request(
-            "GET", f"/v1/machines/{self.id}/execs?limit={int(limit)}"
+            "GET",
+            _qs(f"/v1/machines/{self.id}/execs", limit=limit, cursor=cursor),
         )
-        return [Job(self, r) for r in (out.get("execs") or [])]
+        return Page(
+            [Job(self, r) for r in (out.get("execs") or [])],
+            out.get("next_cursor"),
+        )
+
+    def iter_jobs(self, *, limit: int | None = None) -> Iterator[Job]:
+        """Yield every job on this sandbox, following ``next_cursor``."""
+        cursor = None
+        page_limit = 100 if limit is None else limit
+        while True:
+            page = self.jobs(page_limit, cursor=cursor)
+            yield from page
+            nxt = page.next_cursor
+            if not nxt or nxt == cursor:
+                return
+            cursor = nxt
 
     def close(self, preserve_storage: bool = False) -> None:
         """Destroy the sandbox (and its disk unless ``preserve_storage``)."""

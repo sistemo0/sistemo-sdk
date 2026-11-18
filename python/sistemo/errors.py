@@ -33,6 +33,13 @@ class APIError(SistemoError):
         #: was absent or unparseable.
         self.retry_after = retry_after
         self._request_id = request_id
+        #: Whether sending the identical request again later can succeed without
+        #: changing anything (from the API; ``None`` when the API did not say).
+        raw_retry = self.body.get("retryable")
+        self.retryable: bool | None = None if raw_retry is None else bool(raw_retry)
+        #: The docs entry for :attr:`code` — what it means and what to do.
+        doc = self.body.get("doc_url")
+        self.doc_url: str | None = str(doc) if doc else None
         msg = f"[{status}] {detail}"
         if code:
             msg += f" ({code})"
@@ -69,6 +76,16 @@ class QuotaExceededError(APIError):
 
     A message mentioning "fleet limit" is a rarer variant: a fleet-wide ceiling
     rather than your plan, which topping up will not lift.
+    """
+
+
+class InsufficientBalanceError(APIError):
+    """402 `insufficient_balance` — the prepaid wallet cannot cover this.
+
+    Distinct from :class:`QuotaExceededError` (free a resource and retry) and
+    from :class:`AuthError` (the key is fine). Top up; freeing machines does
+    not help. Anything that creates ongoing cost — a machine create or start,
+    a volume, a snapshot — is refused this way.
     """
 
 
@@ -132,6 +149,8 @@ def api_error(
     # 403 is two different things, told apart by `code` — never by the status.
     if status == 403 and code == "quota_exceeded":
         return QuotaExceededError(status, detail, code, body, **kw)
+    if status == 402:
+        return InsufficientBalanceError(status, detail, code, body, **kw)
     if status in (401, 403):
         return AuthError(status, detail, code, body, **kw)
     if status == 404:

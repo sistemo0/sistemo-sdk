@@ -108,6 +108,25 @@ describe("the exit-code contract", () => {
     assert.equal(j.ok, false, "a lost job must never report ok — we do not know that it worked");
   });
 
+  it("run() lost is not a minus-one exit", async () => {
+    scene.job = jobRec("lost");
+    scene.pages = [page(0, Buffer.alloc(0), true)];
+    const sb = await newSandbox();
+    const r = await sb.run("whatever");
+    assert.equal(r.lost, true);
+    assert.equal(r.exitCode, -1);
+    assert.equal(r.exitCode === -1 && r.lost, true);
+  });
+
+  it("run() genuine minus-one is not lost", async () => {
+    scene.job = jobRec("failed", -1);
+    scene.pages = [page(0, Buffer.alloc(0), true)];
+    const sb = await newSandbox();
+    const r = await sb.run("whatever");
+    assert.equal(r.lost, false);
+    assert.equal(r.exitCode, -1);
+  });
+
   it("a failed job is done but not ok", async () => {
     scene.job = jobRec("failed", 7);
     const sb = await newSandbox();

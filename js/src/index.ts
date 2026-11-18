@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.1.3";
+const USER_AGENT = "@sistemo/sdk/0.1.4";
 
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -37,6 +37,13 @@ export class APIError extends SistemoError {
   readonly body: Record<string, unknown>;
   /** Seconds from `Retry-After`, capped at 60. */
   readonly retryAfter?: number;
+  /**
+   * Whether sending the identical request again later can succeed without
+   * changing anything (from the API; `undefined` when it did not say).
+   */
+  readonly retryable?: boolean;
+  /** The docs entry for `code` — what it means and what to do. */
+  readonly docUrl?: string;
   private readonly explicitRequestId?: string;
   constructor(
     status: number,
@@ -53,6 +60,8 @@ export class APIError extends SistemoError {
     this.body = body ?? {};
     this.retryAfter = extra?.retryAfter;
     this.explicitRequestId = extra?.requestId;
+    this.retryable = typeof this.body.retryable === "boolean" ? this.body.retryable : undefined;
+    this.docUrl = typeof this.body.doc_url === "string" && this.body.doc_url ? this.body.doc_url : undefined;
   }
   get requestId(): string | undefined {
     if (this.explicitRequestId) return this.explicitRequestId;
@@ -79,6 +88,16 @@ export class AuthError extends APIError {}
  * is a fleet-wide ceiling rather than your plan, which topping up will not lift.
  */
 export class QuotaExceededError extends APIError {}
+
+/**
+ * 402 `insufficient_balance` — the prepaid wallet cannot cover this.
+ *
+ * Distinct from `QuotaExceededError` (free a resource and retry) and from
+ * `AuthError` (the key is fine). Top up; freeing machines does not help.
+ * Anything that creates ongoing cost — a machine create or start, a volume, a
+ * snapshot — is refused this way.
+ */
+export class InsufficientBalanceError extends APIError {}
 
 /** 404 — resource not found (or not yours). */
 export class NotFoundError extends APIError {}
@@ -132,6 +151,7 @@ function apiError(
 ): APIError {
   // 403 is two different things, told apart by `code` — never by the status.
   if (status === 403 && code === "quota_exceeded") return new QuotaExceededError(status, detail, code, body, extra);
+  if (status === 402) return new InsufficientBalanceError(status, detail, code, body, extra);
   if (status === 401 || status === 403) return new AuthError(status, detail, code, body, extra);
   if (status === 404) return new NotFoundError(status, detail, code, body, extra);
   if (status === 410) return new GoneError(status, detail, code, body, extra);
@@ -153,6 +173,16 @@ function newIdempotencyKey(): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Append `limit` / `cursor` when set. The API names the query `cursor`. */
+function withQuery(path: string, opts?: { cursor?: string; limit?: number }): string {
+  if (!opts) return path;
+  const q = new URLSearchParams();
+  if (opts.cursor) q.set("cursor", opts.cursor);
+  if (opts.limit != null) q.set("limit", String(opts.limit));
+  const s = q.toString();
+  return s ? `${path}?${s}` : path;
 }
 
 const RETRY_AFTER_CAP_SEC = 60;
@@ -291,6 +321,7 @@ export class Client {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     let res: Response;
+    let text: string;
     try {
       const headers: Record<string, string> = {
         Authorization: `Bearer ${this.apiKey}`,
@@ -308,13 +339,15 @@ export class Client {
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
+      // ⚠ Keep the abort live through the body read. Clearing it when fetch()
+      // resolves (headers only) left a hung body waiting on Node's default
+      // undici bodyTimeout — 300 s. That is the slow-response hang.
+      text = await res.text();
     } catch (e) {
       throw new SistemoError(`connection error: ${(e as Error).message}`);
     } finally {
       clearTimeout(timer);
     }
-
-    const text = await res.text();
     if (!res.ok) {
       let detail = "request failed";
       let code: string | undefined;
@@ -336,7 +369,20 @@ export class Client {
       if (!requestId) requestId = res.headers.get("X-Request-Id") ?? this.lastRequestId;
       throw apiError(res.status, detail, code, body, { retryAfter, requestId: requestId ?? undefined });
     }
-    return (text ? JSON.parse(text) : {}) as T;
+    // ⚠ JSON.parse after a 2xx used to sit outside the fetch try/catch, so a
+    // proxy HTML 200 leaked SyntaxError — not a SistemoError, and GET did not
+    // retry. A 200 whose body is `null` or an array is the same class of lie:
+    // this API's 2xx bodies are objects.
+    let parsed: unknown;
+    try {
+      parsed = text ? JSON.parse(text) : {};
+    } catch (e) {
+      throw new SistemoError(`invalid JSON response: ${(e as Error).message}`);
+    }
+    if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new SistemoError("invalid JSON response: expected an object");
+    }
+    return parsed as T;
   }
 
   private shouldRetryHttp(
@@ -359,10 +405,59 @@ export class Client {
 
   // --- volumes (incl. detachable root volumes) ---------------------------
 
-  /** List the account's volumes (root and data). */
-  async listVolumes(): Promise<{ volumes: Volume[] }> {
-    const out = await this.request<{ volumes?: Volume[] | null }>("GET", "/v1/volumes");
-    return { volumes: out.volumes ?? [] };
+  /**
+   * List the account's volumes (root and data).
+   *
+   * `nextCursor` is `null` on the last page; pass it back as `{ cursor }` for
+   * the next one. Walk every page with {@link iterVolumes}.
+   */
+  async listVolumes(opts?: { cursor?: string; limit?: number }): Promise<{
+    volumes: Volume[];
+    nextCursor: string | null;
+  }> {
+    const out = await this.request<{ volumes?: Volume[] | null; next_cursor?: string | null }>(
+      "GET",
+      withQuery("/v1/volumes", opts),
+    );
+    return { volumes: out.volumes ?? [], nextCursor: out.next_cursor ?? null };
+  }
+
+  /** Yield every volume, following `nextCursor` until the last page. */
+  async *iterVolumes(opts?: { limit?: number }): AsyncGenerator<Volume> {
+    yield* this.iterPages((cursor) => this.listVolumes({ cursor, limit: opts?.limit }), (p) => p.volumes);
+  }
+
+  /**
+   * List the account's machines. Same paging contract as {@link listVolumes}.
+   */
+  async listMachines(opts?: { cursor?: string; limit?: number }): Promise<{
+    machines: Machine[];
+    nextCursor: string | null;
+  }> {
+    const out = await this.request<{ machines?: Machine[] | null; next_cursor?: string | null }>(
+      "GET",
+      withQuery("/v1/machines", opts),
+    );
+    return { machines: out.machines ?? [], nextCursor: out.next_cursor ?? null };
+  }
+
+  /** Yield every machine, following `nextCursor` until the last page. */
+  async *iterMachines(opts?: { limit?: number }): AsyncGenerator<Machine> {
+    yield* this.iterPages((cursor) => this.listMachines({ cursor, limit: opts?.limit }), (p) => p.machines);
+  }
+
+  private async *iterPages<T, P extends { nextCursor: string | null }>(
+    fetch: (cursor?: string) => Promise<P>,
+    items: (page: P) => T[],
+  ): AsyncGenerator<T> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await fetch(cursor);
+      for (const item of items(page)) yield item;
+      const nxt = page.nextCursor;
+      if (!nxt || nxt === cursor) return;
+      cursor = nxt;
+    }
   }
 
   /** Create a standalone data volume. */
@@ -413,12 +508,36 @@ export interface Volume {
   machine_id?: string;
 }
 
+export interface Machine {
+  id: string;
+  name?: string;
+  state: string;
+  vcpus?: number;
+  memory_mb?: number;
+  rootfs_size_gb?: number;
+  stack?: string;
+}
+
+/** One page of `jobs()`. A real array plus `nextCursor`. */
+export type JobPage = Job[] & { nextCursor: string | null };
+
 export interface ExecResult {
   exitCode: number;
   stdout: string;
   stderr: string;
   truncated?: boolean;
   requestId?: string;
+  /** True only for a command that finished and exited 0. A lost command is never ok. */
+  ok?: boolean;
+  /**
+   * The machine could not account for this command.
+   *
+   * ⚠ When true, `exitCode` is a PLACEHOLDER (-1) and means nothing — we can
+   * say neither that the command ran nor that it did not. Without this flag a
+   * machine that died mid-command is indistinguishable from a command that
+   * genuinely exited -1.
+   */
+  lost?: boolean;
 }
 
 export interface SandboxOptions extends ClientOptions {
@@ -478,6 +597,31 @@ export class Sandbox {
   }
 
   /**
+   * Re-attach to an existing machine — after a crash, or from a stored id.
+   *
+   * Does **not** provision a new microVM. The machine must still exist
+   * (a 404 is {@link NotFoundError}).
+   */
+  static async connect(id: string, opts: SandboxOptions = {}): Promise<Sandbox> {
+    if (!id) {
+      throw new SistemoError("machine id is required");
+    }
+    const client = opts.client ?? new Client(opts);
+    const machine = await client.request<{ id?: string; state?: string }>(
+      "GET",
+      `/v1/machines/${id}`,
+    );
+    if (!machine?.id) {
+      throw new APIError(
+        502,
+        "machine response missing id — refusing to continue",
+        "invalid_machine_response",
+      );
+    }
+    return new Sandbox(client, machine.id, machine.state ?? "");
+  }
+
+  /**
    * Run a shell command/script inside the sandbox and return its output.
    *
    * This is start + wait on a guest job (`POST /execs`). Default timeout 120s,
@@ -501,12 +645,19 @@ export class Sandbox {
     }
     await job.wait();
     const dec = new TextDecoder("utf-8");
+    // ⚠ -1 is a placeholder for "unknown", not a real status. `lost` is what
+    // carries that fact; exitCode alone cannot, because -1 is also a status a
+    // real command can exit with.
+    const exitCode = job.exitCode ?? -1;
+    const lost = job.lost;
     return {
-      exitCode: job.exitCode ?? -1,
+      exitCode,
       stdout: dec.decode(await job.output("stdout")),
       stderr: dec.decode(await job.output("stderr")),
       truncated: job.truncated,
       requestId: job.requestId,
+      lost,
+      ok: exitCode === 0 && !lost,
     };
   }
 
@@ -574,13 +725,33 @@ export class Sandbox {
     return new Job(this.client, this.id, rec);
   }
 
-  /** List this sandbox's async jobs, newest first. */
-  async jobs(limit = 50): Promise<Job[]> {
-    const out = await this.client.request<{ execs?: JobRecord[] }>(
+  /**
+   * List this sandbox's async jobs, newest first.
+   *
+   * A list with `nextCursor` (`null` on the last page), so `jobs[0]` and
+   * `for (const j of jobs)` keep working. The guest keeps at most 64, so the
+   * default page holds them all. Walk every page with {@link iterJobs}.
+   */
+  async jobs(limit = 100, opts?: { cursor?: string }): Promise<JobPage> {
+    const out = await this.client.request<{ execs?: JobRecord[] | null; next_cursor?: string | null }>(
       "GET",
-      `/v1/machines/${this.id}/execs?limit=${limit}`,
+      withQuery(`/v1/machines/${this.id}/execs`, { cursor: opts?.cursor, limit }),
     );
-    return (out.execs ?? []).map((r) => new Job(this.client, this.id, r));
+    const jobs = (out.execs ?? []).map((r) => new Job(this.client, this.id, r)) as JobPage;
+    jobs.nextCursor = out.next_cursor ?? null;
+    return jobs;
+  }
+
+  /** Yield every job on this sandbox, following `nextCursor`. */
+  async *iterJobs(opts?: { limit?: number }): AsyncGenerator<Job> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.jobs(opts?.limit ?? 100, { cursor });
+      for (const job of page) yield job;
+      const nxt = page.nextCursor;
+      if (!nxt || nxt === cursor) return;
+      cursor = nxt;
+    }
   }
 
   /** Destroy the sandbox (and its disk unless `preserveStorage`). */
