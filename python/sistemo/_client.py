@@ -131,10 +131,11 @@ class Client:
     The API key is read from ``api_key=`` or the ``SISTEMO_API_KEY`` env var.
     The base URL is ``base_url=`` or ``SISTEMO_BASE_URL`` (default production).
 
-    Retries (default max 3 attempts): connection failures always; HTTP
-    408/429/5xx only when safe (GET/DELETE, or POST/PUT/PATCH with an
-    ``Idempotency-Key``). Exec without an idempotency key is **not** retried
-    on HTTP errors (would re-run the guest script).
+    Retries (default max 3 attempts) only when replaying cannot start a
+    second side effect: GET/HEAD/OPTIONS/DELETE, or POST/PUT/PATCH with an
+    ``Idempotency-Key``. Connection failures and HTTP 408/429/5xx follow
+    that same rule. Exec without an idempotency key is **not** retried
+    (would re-run the guest script).
     """
 
     def __init__(
@@ -203,9 +204,12 @@ class Client:
                     raise
                 self._sleep(attempt, e)
             except SistemoError as e:
-                # connection / timeout
+                # connection / timeout / invalid JSON. Same safety rule as
+                # HTTP retries: a POST without Idempotency-Key must not replay.
                 last_err = e
-                if attempt >= retries:
+                if attempt >= retries or not self._retry_safe(
+                    method_u, idempotency_key
+                ):
                     raise
                 self._sleep(attempt, None)
 
@@ -289,16 +293,25 @@ class Client:
             # the GET retry path.
             raise SistemoError(f"connection error: {e}") from e
 
+    def _retry_safe(self, method: str, idempotency_key: str | None) -> bool:
+        """Whether replaying this call cannot start a second side effect.
+
+        ⚠ POST /execs has no Idempotency-Key. A dropped connection after the
+        guest accepted the start would re-run the script if we retried. The
+        caller-minted exec_id makes a replay a 409, which is safe — and still
+        contradicts "exec starts are never retried". GET/HEAD/OPTIONS/DELETE
+        and POSTs that opted into idempotency may retry.
+        """
+        if method in ("GET", "HEAD", "OPTIONS", "DELETE"):
+            return True
+        return bool(idempotency_key)
+
     def _should_retry_http(
         self, method: str, status: int, idempotency_key: str | None
     ) -> bool:
         if status not in _RETRY_STATUSES:
             return False
-        # Safe methods + DELETE (destroy is idempotent enough for retry).
-        if method in ("GET", "HEAD", "OPTIONS", "DELETE"):
-            return True
-        # Mutating methods only when the caller opted into idempotency.
-        return bool(idempotency_key)
+        return self._retry_safe(method, idempotency_key)
 
     def _sleep(self, attempt: int, err: APIError | None) -> None:
         time.sleep(

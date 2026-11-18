@@ -66,7 +66,13 @@ A **read** API key can list resources but cannot create sandboxes or run code �
 ## Errors
 
 ```python
-from sistemo import APIError, AuthError, InsufficientBalanceError, QuotaExceededError
+from sistemo import (
+    APIError,
+    AuthError,
+    InsufficientBalanceError,
+    QuotaExceededError,
+    TooManyExecsError,
+)
 
 try:
     with Sandbox() as sb:
@@ -79,6 +85,8 @@ except QuotaExceededError as e:
 except InsufficientBalanceError as e:
     # Prepaid wallet cannot cover this. Top up; freeing machines does not help.
     print(e.detail)
+except TooManyExecsError:
+    ...          # 409 — this machine already has 16 commands running; wait
 except AuthError:
     ...          # 401/403 — key missing/invalid/revoked, or read-only key
 except APIError as e:
@@ -163,6 +171,9 @@ Branch on `state`, or use `job.ok`.
 **`lost` is not `failed`.** `failed` means the command ran and returned non-zero.
 `lost` means the machine could not account for it — we can say neither that it
 ran nor that it did not. Do not retry blindly and do not assume completion.
+If the machine stops while `run()` / `wait()` is polling, the result is
+`lost=True` (not a raised 409). `start()` on a machine that is already
+stopped raises `MachineNotRunningError`.
 
 **A failed `start()` may still have started something.** If it raises
 `ExecStartUnconfirmed`, the command may be running; the exception carries the
@@ -181,3 +192,24 @@ except ExecStartUnconfirmed as e:
 You mint `exec_id` (a UUID is generated if you omit it). Re-sending the same id
 is a 409 and returns the existing job, not a second run. If start raises
 `ExecStartUnconfirmed`, poll that id — do not start again.
+
+The 17th concurrent command is `TooManyExecsError` (`too_many_execs`): wait for
+one to finish; a new id does not help. `POST /execs` is never retried — not on
+HTTP 5xx/429, and not on a dropped connection.
+
+## Changelog
+
+### 0.1.5
+
+- `TooManyExecsError` for the 17th concurrent `run()` / `start()`.
+- `ProcessLimitError`, `DiskFullError`, `OutOfMemoryError`, `MachineNotRunningError`.
+- `run()` / `wait()` return `lost=True` when the machine stops mid-wait.
+- `POST /execs` is never retried, including dropped connections.
+
+### 0.1.4
+
+- Abort kept through the response body (JS no longer hangs 300 s).
+- GET retries after a dropped connection; raw stdlib errors wrapped.
+- Non-object 2xx JSON is `SistemoError`.
+- `retryable` / `doc_url` on `APIError`; `InsufficientBalanceError` for HTTP 402.
+- Pagination helpers (`Page`, `iter_*`, JS `nextCursor`); `Sandbox.connect()`; `ExecResult.lost`.

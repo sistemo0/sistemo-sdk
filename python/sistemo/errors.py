@@ -135,6 +135,35 @@ class RateLimitError(APIError):
     """429 — slow down."""
 
 
+class TooManyExecsError(APIError):
+    """409 `too_many_execs` — this machine already has 16 commands running.
+
+    Wait for one to finish. Minting a new ``exec_id`` does not help; that is
+    :class:`APIError` with ``exec_id_in_use``, which means "this id is taken".
+    """
+
+
+class ProcessLimitError(APIError):
+    """409 `machine_process_limit` — the guest's process cap is full."""
+
+
+class DiskFullError(APIError):
+    """409 `machine_disk_full` — the guest has no space left to start this."""
+
+
+class OutOfMemoryError(APIError):
+    """409 `machine_out_of_memory` — the guest refused this for lack of RAM."""
+
+
+class MachineNotRunningError(APIError):
+    """409 `machine_not_running` — the machine is stopped or destroyed.
+
+    Raised by ``start()``. ``wait()`` / ``run()`` on a job that was already
+    started map this to ``lost`` instead: the command may have run, and we
+    can no longer say.
+    """
+
+
 def api_error(
     status: int,
     detail: str,
@@ -159,6 +188,18 @@ def api_error(
         return GoneError(status, detail, code, body, **kw)
     if status == 429:
         return RateLimitError(status, detail, code, body, **kw)
+    if status == 409:
+        if code == "too_many_execs":
+            return TooManyExecsError(status, detail, code, body, **kw)
+        if code == "machine_process_limit":
+            return ProcessLimitError(status, detail, code, body, **kw)
+        if code == "machine_disk_full":
+            return DiskFullError(status, detail, code, body, **kw)
+        if code == "machine_out_of_memory":
+            return OutOfMemoryError(status, detail, code, body, **kw)
+        if code == "machine_not_running":
+            return MachineNotRunningError(status, detail, code, body, **kw)
+        # exec_id_in_use / conflict: start() recovers those by GET.
     if status == 501:
         return AsyncExecUnsupportedError(status, detail, code, body, **kw)
     # ⚠ Only a 503 that NAMES an exec is the unconfirmed-start case. A plain 503

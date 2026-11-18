@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.1.4";
+const USER_AGENT = "@sistemo/sdk/0.1.5";
 
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -142,6 +142,41 @@ export class ExecStartUnconfirmed extends APIError {
   }
 }
 
+/**
+ * 409 `too_many_execs` — this machine already has 16 commands running.
+ *
+ * Wait for one to finish. Minting a new `execId` does not help; that is a
+ * plain `APIError` with `exec_id_in_use`, which means "this id is taken".
+ */
+export class TooManyExecsError extends APIError {}
+
+/** 409 `machine_process_limit` — the guest's process cap is full. */
+export class ProcessLimitError extends APIError {}
+
+/** 409 `machine_disk_full` — the guest has no space left to start this. */
+export class DiskFullError extends APIError {}
+
+/** 409 `machine_out_of_memory` — the guest refused this for lack of RAM. */
+export class OutOfMemoryError extends APIError {}
+
+/**
+ * 409 `machine_not_running` — the machine is stopped or destroyed.
+ *
+ * Raised by `start()`. `wait()` / `run()` on a job that was already started
+ * map this to `lost` instead: the command may have run, and we can no longer
+ * say.
+ */
+export class MachineNotRunningError extends APIError {}
+
+/** The machine (or its job record) is gone — we cannot say what ran. */
+function jobUnaccountable(e: unknown): boolean {
+  return (
+    e instanceof MachineNotRunningError ||
+    e instanceof NotFoundError ||
+    e instanceof GoneError
+  );
+}
+
 function apiError(
   status: number,
   detail: string,
@@ -156,6 +191,14 @@ function apiError(
   if (status === 404) return new NotFoundError(status, detail, code, body, extra);
   if (status === 410) return new GoneError(status, detail, code, body, extra);
   if (status === 429) return new RateLimitError(status, detail, code, body, extra);
+  if (status === 409) {
+    if (code === "too_many_execs") return new TooManyExecsError(status, detail, code, body, extra);
+    if (code === "machine_process_limit") return new ProcessLimitError(status, detail, code, body, extra);
+    if (code === "machine_disk_full") return new DiskFullError(status, detail, code, body, extra);
+    if (code === "machine_out_of_memory") return new OutOfMemoryError(status, detail, code, body, extra);
+    if (code === "machine_not_running") return new MachineNotRunningError(status, detail, code, body, extra);
+    // exec_id_in_use / conflict: start() recovers those by GET.
+  }
   if (status === 501) return new AsyncExecUnsupportedError(status, detail, code, body, extra);
   // ⚠ Only a 503 that NAMES an exec is the unconfirmed-start case. A plain 503
   // (no host available, say) is an ordinary retryable error and must not be
@@ -304,7 +347,7 @@ export class Client {
           attempt < retries &&
           (e instanceof APIError
             ? this.shouldRetryHttp(methodU, e.status, opts.idempotencyKey)
-            : e instanceof SistemoError); // connection / abort
+            : e instanceof SistemoError && this.retrySafe(methodU, opts.idempotencyKey));
         if (!can) throw e;
         await this.backoff(attempt, e instanceof APIError ? e : undefined);
       }
@@ -385,16 +428,26 @@ export class Client {
     return parsed as T;
   }
 
+  /**
+   * Whether replaying this call cannot start a second side effect.
+   *
+   * ⚠ POST /execs has no Idempotency-Key. A dropped connection after the guest
+   * accepted the start would re-run the script if we retried.
+   */
+  private retrySafe(method: string, idempotencyKey?: string): boolean {
+    if (method === "GET" || method === "HEAD" || method === "OPTIONS" || method === "DELETE") {
+      return true;
+    }
+    return Boolean(idempotencyKey);
+  }
+
   private shouldRetryHttp(
     method: string,
     status: number,
     idempotencyKey?: string,
   ): boolean {
     if (!RETRY_STATUSES.has(status)) return false;
-    if (method === "GET" || method === "HEAD" || method === "OPTIONS" || method === "DELETE") {
-      return true;
-    }
-    return Boolean(idempotencyKey);
+    return this.retrySafe(method, idempotencyKey);
   }
 
   private async backoff(attempt: number, err?: APIError): Promise<void> {
@@ -626,6 +679,8 @@ export class Sandbox {
    *
    * This is start + wait on a guest job (`POST /execs`). Default timeout 120s,
    * ceiling 24 hours. A proxy never holds the connection for the whole command.
+   * HTTP 5xx/429 and dropped connections on start are not retried. If the
+   * machine stops while waiting, this returns `lost: true` rather than throwing 409.
    */
   async run(
     script: string,
@@ -669,7 +724,8 @@ export class Sandbox {
    *
    * ⚠ You mint `execId` (a UUID is generated if you omit it). If the start
    * response is lost, poll that id rather than starting again. Re-sending the
-   * same id is a 409, not a second run.
+   * same id is a 409 `exec_id_in_use`, not a second run. `too_many_execs` is
+   * {@link TooManyExecsError}: wait for a command to finish.
    *
    * ⚠ On {@link ExecStartUnconfirmed} the command **may be running**. The error
    * carries `execId`; poll it with {@link job} rather than starting over.
@@ -688,6 +744,7 @@ export class Sandbox {
         "POST",
         `/v1/machines/${this.id}/execs`,
         body,
+        { maxRetries: 0 },
       );
       return new Job(this.client, this.id, rec);
     } catch (e) {
@@ -855,14 +912,25 @@ export class Job {
     return this.state === "lost";
   }
 
+  private markLost(): this {
+    this.state = "lost";
+    this.exitCode = null;
+    return this;
+  }
+
   /** Re-read the job's state from the API. */
   async refresh(): Promise<this> {
-    return this.apply(
-      await this.client.request<JobRecord>(
-        "GET",
-        `/v1/machines/${this.sandboxId}/execs/${this.id}`,
-      ),
-    );
+    try {
+      return this.apply(
+        await this.client.request<JobRecord>(
+          "GET",
+          `/v1/machines/${this.sandboxId}/execs/${this.id}`,
+        ),
+      );
+    } catch (e) {
+      if (jobUnaccountable(e)) return this.markLost();
+      throw e;
+    }
   }
 
   /**
@@ -912,12 +980,17 @@ export class Job {
    * safe.
    */
   async cancel(): Promise<this> {
-    return this.apply(
-      await this.client.request<JobRecord>(
-        "DELETE",
-        `/v1/machines/${this.sandboxId}/execs/${this.id}`,
-      ),
-    );
+    try {
+      return this.apply(
+        await this.client.request<JobRecord>(
+          "DELETE",
+          `/v1/machines/${this.sandboxId}/execs/${this.id}`,
+        ),
+      );
+    } catch (e) {
+      if (jobUnaccountable(e)) return this.markLost();
+      throw e;
+    }
   }
 
   /**
@@ -935,15 +1008,24 @@ export class Job {
     const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
     let offset = 0;
     for (;;) {
-      const page = await this.client.request<{
-        next_offset?: number;
-        data?: string;
-        eof?: boolean;
-      }>(
-        "GET",
-        `/v1/machines/${this.sandboxId}/execs/${this.id}/output` +
-          `?stream=${which}&offset=${offset}&limit=${limit}`,
-      );
+      let page: { next_offset?: number; data?: string; eof?: boolean };
+      try {
+        page = await this.client.request<{
+          next_offset?: number;
+          data?: string;
+          eof?: boolean;
+        }>(
+          "GET",
+          `/v1/machines/${this.sandboxId}/execs/${this.id}/output` +
+            `?stream=${which}&offset=${offset}&limit=${limit}`,
+        );
+      } catch (e) {
+        if (jobUnaccountable(e)) {
+          this.markLost();
+          return;
+        }
+        throw e;
+      }
       offset = page.next_offset ?? offset;
       const data = page.data ? base64ToBytes(page.data) : new Uint8Array(0);
       if (data.length > 0) {
@@ -992,11 +1074,20 @@ export class Job {
     const parts: Uint8Array[] = [];
     let offset = 0;
     for (;;) {
-      const page = await this.client.request<{ next_offset?: number; data?: string }>(
-        "GET",
-        `/v1/machines/${this.sandboxId}/execs/${this.id}/output` +
-          `?stream=${which}&offset=${offset}&limit=65536`,
-      );
+      let page: { next_offset?: number; data?: string };
+      try {
+        page = await this.client.request<{ next_offset?: number; data?: string }>(
+          "GET",
+          `/v1/machines/${this.sandboxId}/execs/${this.id}/output` +
+            `?stream=${which}&offset=${offset}&limit=65536`,
+        );
+      } catch (e) {
+        if (jobUnaccountable(e)) {
+          this.markLost();
+          break;
+        }
+        throw e;
+      }
       const data = page.data ? base64ToBytes(page.data) : new Uint8Array(0);
       if (data.length > 0) parts.push(data);
       const next = page.next_offset ?? offset;
