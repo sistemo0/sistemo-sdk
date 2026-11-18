@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import random
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from ._version import __version__
 from .errors import APIError, SistemoError, api_error
@@ -74,6 +76,34 @@ USER_AGENT = f"sistemo-python/{__version__}"
 
 # Transient HTTP statuses worth retrying (with care — see request()).
 _RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+class Page(list):
+    """One page of a keyset-paginated list.
+
+    A list subclass so ``page[0]``, ``for item in page``, and ``== []`` keep
+    working. ``next_cursor`` is ``None`` on the last page; pass it back as
+    ``cursor=`` for the next one.
+    """
+
+    def __init__(self, items=(), next_cursor: str | None = None):
+        super().__init__(items)
+        self.next_cursor = next_cursor
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"Page({list.__repr__(self)}, next_cursor={self.next_cursor!r})"
+
+
+def _qs(path: str, **params: Any) -> str:
+    """Append ``limit`` / ``cursor`` (and any other query) when they are set."""
+    pairs = []
+    for k, v in params.items():
+        if v is None or v == "":
+            continue
+        pairs.append((k, str(v)))
+    if not pairs:
+        return path
+    return path + "?" + urllib.parse.urlencode(pairs)
 
 
 class Client:
@@ -227,6 +257,13 @@ class Client:
             # so catching TimeoutError alone let a raw stdlib exception escape
             # to the caller and skipped the connection-retry path entirely.
             raise SistemoError(f"connection error: timeout ({e})") from e
+        except (http.client.HTTPException, ConnectionError) as e:
+            # ⚠ RemoteDisconnected / IncompleteRead are HTTPException, not
+            # URLError. They fire when the peer closes after headers (or with
+            # no response at all) — urlopen can succeed and then resp.read()
+            # raises. Leaving them uncaught leaked a stdlib type and skipped
+            # the GET retry path.
+            raise SistemoError(f"connection error: {e}") from e
 
     def _should_retry_http(
         self, method: str, status: int, idempotency_key: str | None
@@ -246,10 +283,44 @@ class Client:
 
     # --- volumes (incl. detachable root volumes) ---------------------------
 
-    def list_volumes(self) -> list[dict]:
-        """List the account's volumes (root and data)."""
+    def list_volumes(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> Page:
+        """List the account's volumes (root and data).
+
+        Returns a :class:`Page`. Index it like a list; ``next_cursor`` is
+        ``None`` on the last page. Walk every page with :meth:`iter_volumes`.
+        """
         # API may return "volumes": null when empty — never hand back None.
-        return self.request("GET", "/v1/volumes").get("volumes") or []
+        out = self.request("GET", _qs("/v1/volumes", cursor=cursor, limit=limit))
+        return Page(out.get("volumes") or [], out.get("next_cursor"))
+
+    def iter_volumes(self, *, limit: int | None = None) -> Iterator[dict]:
+        """Yield every volume, following ``next_cursor`` until the last page."""
+        yield from self._iter_pages(self.list_volumes, limit=limit)
+
+    def list_machines(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> Page:
+        """List the account's machines. Same paging contract as :meth:`list_volumes`."""
+        out = self.request("GET", _qs("/v1/machines", cursor=cursor, limit=limit))
+        return Page(out.get("machines") or [], out.get("next_cursor"))
+
+    def iter_machines(self, *, limit: int | None = None) -> Iterator[dict]:
+        """Yield every machine, following ``next_cursor`` until the last page."""
+        yield from self._iter_pages(self.list_machines, limit=limit)
+
+    def _iter_pages(self, fetch, *, limit: int | None = None) -> Iterator[dict]:
+        cursor = None
+        while True:
+            page = fetch(cursor=cursor, limit=limit)
+            yield from page
+            nxt = page.next_cursor
+            # Stop on last page, and if a cursor ever repeats — that is a
+            # broken page, not a reason to loop forever.
+            if not nxt or nxt == cursor:
+                return
+            cursor = nxt
 
     def create_volume(self, name: str, size_gb: int) -> dict:
         """Create a standalone data volume."""

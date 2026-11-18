@@ -33,6 +33,13 @@ class APIError(SistemoError):
         #: was absent or unparseable.
         self.retry_after = retry_after
         self._request_id = request_id
+        #: Whether sending the identical request again later can succeed without
+        #: changing anything (from the API; ``None`` when the API did not say).
+        raw_retry = self.body.get("retryable")
+        self.retryable: bool | None = None if raw_retry is None else bool(raw_retry)
+        #: The docs entry for :attr:`code` — what it means and what to do.
+        doc = self.body.get("doc_url")
+        self.doc_url: str | None = str(doc) if doc else None
         msg = f"[{status}] {detail}"
         if code:
             msg += f" ({code})"

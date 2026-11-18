@@ -49,7 +49,7 @@ Or pass them explicitly: `Sandbox.create({ apiKey: "sk_live_…", baseUrl: "http
 
 ```ts
 const sb = await Sandbox.create({ vcpus: 1, memoryMb: 1024, stack: "base" });
-const res = await sb.run("echo hi && uname -a");     // -> { exitCode, stdout, stderr, truncated, requestId } (default 120s, max 24h)
+const res = await sb.run("echo hi && uname -a");     // -> { exitCode, stdout, stderr, truncated, requestId, lost } (default 120s, max 24h)
 await sb.run("node app.js", 120, { env: { FOO: "bar" }, cwd: "/tmp" });
 await sb.close();                                    // destroy
 ```
@@ -70,7 +70,7 @@ try {
   // quota refusal does once you free the resource it names.
   if (e instanceof QuotaExceededError) { console.log(e.detail); }
   else if (e instanceof AuthError) { /* 401/403 — key invalid or read-only */ }
-  else if (e instanceof APIError) { console.log(e.status, e.detail, e.code, e.requestId); }
+  else if (e instanceof APIError) { console.log(e.status, e.detail, e.code, e.requestId, e.retryable, e.docUrl); }
 }
 ```
 
@@ -80,8 +80,26 @@ alongside current usage.
 
 Every request sends `X-Request-Id`. Quote `e.requestId` when you contact support.
 On `429`, the client honours `Retry-After` (capped at 60 s) from version 0.1.3.
+`e.retryable` and `e.docUrl` come from the API body when it sent them.
 
 Apache-2.0.
+
+## List machines and volumes
+
+Lists are keyset-paginated. `listVolumes()` / `listMachines()` return
+`{ volumes|machines, nextCursor }` (`null` means the last page). Walk every
+page with `iterVolumes()` / `iterMachines()`.
+
+```ts
+import { Client } from "@sistemo/sdk";
+
+const c = new Client();
+const page = await c.listVolumes();               // page.volumes[0].id, page.nextCursor
+const next = await c.listVolumes({ cursor: page.nextCursor ?? undefined, limit: 50 });
+for await (const vol of c.iterVolumes()) {
+  console.log(vol.id);
+}
+```
 
 ## Long-running commands
 

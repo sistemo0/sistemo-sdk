@@ -26,6 +26,8 @@ const state = {
   failQueue: [],
   idemCreate: new Map(),
   volumesNull: false,
+  paginate: false,
+  dropCount: 0,
   jobs: new Map(),
 };
 
@@ -73,6 +75,12 @@ before(async () => {
     const idem = req.headers["idempotency-key"] || "";
     const reqId = req.headers["x-request-id"] || "";
     state.log.push({ method, path, fullPath, body, auth, ua: String(ua), idem: String(idem), reqId: String(reqId) });
+
+    if (state.dropCount > 0) {
+      state.dropCount -= 1;
+      req.destroy();
+      return;
+    }
 
     if (state.failQueue.length) {
       const f = state.failQueue.shift();
@@ -161,11 +169,34 @@ before(async () => {
     }
 
     if (method === "GET" && path === "/v1/volumes") {
-      if (state.volumesNull) {
-        send(res, 200, { volumes: null });
-      } else {
-        send(res, 200, { volumes: [{ id: "v1", name: "disk", size_gb: 10 }] });
+      const cursor = url.searchParams.get("cursor");
+      if (state.paginate) {
+        if (cursor === "p2") {
+          send(res, 200, { volumes: [{ id: "v2", name: "disk2", size_gb: 10 }], next_cursor: null });
+        } else {
+          send(res, 200, { volumes: [{ id: "v1", name: "disk", size_gb: 10 }], next_cursor: "p2" });
+        }
+        return;
       }
+      if (state.volumesNull) {
+        send(res, 200, { volumes: null, next_cursor: null });
+      } else {
+        send(res, 200, { volumes: [{ id: "v1", name: "disk", size_gb: 10 }], next_cursor: null });
+      }
+      return;
+    }
+
+    if (method === "GET" && path === "/v1/machines") {
+      const cursor = url.searchParams.get("cursor");
+      if (state.paginate) {
+        if (cursor === "p2") {
+          send(res, 200, { machines: [{ id: "m2", state: "running" }], next_cursor: null });
+        } else {
+          send(res, 200, { machines: [{ id: "m1", state: "running" }], next_cursor: "p2" });
+        }
+        return;
+      }
+      send(res, 200, { machines: [...state.machines.values()], next_cursor: null });
       return;
     }
 
@@ -193,6 +224,8 @@ beforeEach(() => {
   state.failQueue = [];
   state.idemCreate.clear();
   state.volumesNull = false;
+  state.paginate = false;
+  state.dropCount = 0;
   state.jobs.clear();
   delete process.env.SISTEMO_API_KEY;
   delete process.env.SISTEMO_BASE_URL;
@@ -263,6 +296,48 @@ describe("Client", () => {
     state.volumesNull = true;
     const out = await c.listVolumes();
     assert.deepEqual(out.volumes, []);
+    assert.equal(out.nextCursor, null);
+  });
+
+  it("listVolumes keeps nextCursor and sends cursor/limit", async () => {
+    const c = new Client({ apiKey: "k", baseUrl });
+    state.paginate = true;
+    const page = await c.listVolumes();
+    assert.equal(page.volumes[0].id, "v1");
+    assert.equal(page.nextCursor, "p2");
+    const page2 = await c.listVolumes({ cursor: page.nextCursor, limit: 1 });
+    assert.equal(page2.volumes[0].id, "v2");
+    assert.equal(page2.nextCursor, null);
+    const last = state.log.at(-1);
+    assert.match(last.fullPath, /cursor=p2/);
+    assert.match(last.fullPath, /limit=1/);
+  });
+
+  it("iterVolumes walks pages", async () => {
+    const c = new Client({ apiKey: "k", baseUrl });
+    state.paginate = true;
+    const ids = [];
+    for await (const v of c.iterVolumes()) ids.push(v.id);
+    assert.deepEqual(ids, ["v1", "v2"]);
+  });
+
+  it("listMachines and iterMachines", async () => {
+    const c = new Client({ apiKey: "k", baseUrl });
+    state.paginate = true;
+    const page = await c.listMachines();
+    assert.equal(page.machines[0].id, "m1");
+    assert.equal(page.nextCursor, "p2");
+    const ids = [];
+    for await (const m of c.iterMachines()) ids.push(m.id);
+    assert.deepEqual(ids, ["m1", "m2"]);
+  });
+
+  it("a dropped GET is a SistemoError and is retried", async () => {
+    const c = new Client({ apiKey: "k", baseUrl, maxRetries: 2, retryBackoffMs: 5 });
+    state.dropCount = 1;
+    const out = await c.listVolumes();
+    assert.equal(out.volumes[0].id, "v1");
+    assert.equal(state.log.filter((l) => l.path === "/v1/volumes").length, 2);
   });
 });
 
@@ -459,6 +534,68 @@ describe("request id and Retry-After", () => {
     assert.equal(parseRetryAfter("12"), 12);
     assert.equal(parseRetryAfter("nope"), undefined);
     assert.equal(parseRetryAfter("-1"), undefined);
+  });
+
+  it("an error lifts retryable and docUrl", async () => {
+    const c = new Client({ apiKey: "k", baseUrl, maxRetries: 0 });
+    state.failNext = {
+      status: 409,
+      body: {
+        code: "too_many_execs",
+        detail: "wait",
+        retryable: true,
+        doc_url: "https://docs.sistemo.io/errors/too_many_execs",
+      },
+    };
+    await assert.rejects(() => c.request("GET", "/v1/volumes"), (err) => {
+      assert.equal(err.retryable, true);
+      assert.equal(err.docUrl, "https://docs.sistemo.io/errors/too_many_execs");
+      return true;
+    });
+  });
+
+  it("retryable absent is undefined, not false", async () => {
+    const c = new Client({ apiKey: "k", baseUrl, maxRetries: 0 });
+    state.failNext = { status: 500, body: { detail: "boom" } };
+    await assert.rejects(() => c.request("GET", "/v1/volumes"), (err) => {
+      assert.equal(err.retryable, undefined);
+      assert.equal(err.docUrl, undefined);
+      return true;
+    });
+  });
+
+  it("retryable false stays false", () => {
+    const err = new APIError(400, "bad", "validation_error", { retryable: false });
+    assert.equal(err.retryable, false);
+  });
+});
+
+describe("hung body", () => {
+  // ⚠ 0.1.3 cleared the abort timer when fetch() resolved (headers only), so a
+  // hung body waited on Node's default undici bodyTimeout — 300 s. Keep the
+  // abort live through res.text() or this test fails at the 2s timeout.
+  it("aborts a hung body instead of waiting 300s", { timeout: 2000 }, async () => {
+    const hung = createServer((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": "100" });
+      if (typeof res.flushHeaders === "function") res.flushHeaders();
+      res.write(" ");
+      // never res.end() — body stays open
+    });
+    await new Promise((r) => hung.listen(0, "127.0.0.1", r));
+    const hungUrl = `http://127.0.0.1:${hung.address().port}`;
+    try {
+      const c = new Client({ apiKey: "k", baseUrl: hungUrl, timeoutMs: 80, maxRetries: 0 });
+      const t0 = Date.now();
+      await assert.rejects(() => c.listVolumes(), (err) => {
+        assert.ok(err instanceof SistemoError);
+        assert.match(err.message, /connection error/);
+        return true;
+      });
+      assert.ok(Date.now() - t0 < 500, `hung body took ${Date.now() - t0}ms; abort is not live through the body read`);
+    } finally {
+      hung.closeAllConnections?.();
+      await new Promise((r) => hung.close(r));
+    }
   });
 });
 

@@ -22,6 +22,7 @@ from sistemo.errors import (
 )
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from sistemo import (
     APIError,
@@ -50,6 +51,10 @@ class _MockAPI(BaseHTTPRequestHandler):
     idem_create: dict[str, str] = {}
     # Empty volumes list returns null (real API quirk).
     volumes_null: bool = False
+    # Two-page list: first page next_cursor=p2, second page is the last.
+    paginate: bool = False
+    # Close without a byte of HTTP this many times (RemoteDisconnected).
+    drop_count: int = 0
     jobs: dict[str, dict] = {}
 
     def log_message(self, format: str, *args) -> None:  # quiet
@@ -106,6 +111,15 @@ class _MockAPI(BaseHTTPRequestHandler):
                 "req_id": self.headers.get("X-Request-Id", ""),
             }
         )
+
+        if _MockAPI.drop_count > 0:
+            _MockAPI.drop_count -= 1
+            self.close_connection = True
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+            return
 
         if _MockAPI.fail_queue:
             fail = _MockAPI.fail_queue.pop(0)
@@ -164,7 +178,6 @@ class _MockAPI(BaseHTTPRequestHandler):
         if method == "GET" and "/execs/" in path and path.endswith("/output"):
             eid = path.split("/")[5]
             job = _MockAPI.jobs.get(eid, {})
-            from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(full_path).query)
             offset = int(q.get("offset", ["0"])[0])
             data = job.get("stdout", b"") if q.get("stream", ["stdout"])[0] != "stderr" else b""
@@ -198,10 +211,53 @@ class _MockAPI(BaseHTTPRequestHandler):
             return
 
         if method == "GET" and path == "/v1/volumes":
+            cursor = (parse_qs(urlparse(full_path).query).get("cursor") or [None])[0]
+            if _MockAPI.paginate:
+                if cursor == "p2":
+                    self._send(
+                        200,
+                        {
+                            "volumes": [{"id": "v2", "name": "disk2", "size_gb": 10}],
+                            "next_cursor": None,
+                        },
+                    )
+                else:
+                    self._send(
+                        200,
+                        {
+                            "volumes": [{"id": "v1", "name": "disk", "size_gb": 10}],
+                            "next_cursor": "p2",
+                        },
+                    )
+                return
             if _MockAPI.volumes_null:
-                self._send(200, {"volumes": None})
+                self._send(200, {"volumes": None, "next_cursor": None})
             else:
-                self._send(200, {"volumes": [{"id": "v1", "name": "disk", "size_gb": 10}]})
+                self._send(
+                    200,
+                    {
+                        "volumes": [{"id": "v1", "name": "disk", "size_gb": 10}],
+                        "next_cursor": None,
+                    },
+                )
+            return
+
+        if method == "GET" and path == "/v1/machines":
+            cursor = (parse_qs(urlparse(full_path).query).get("cursor") or [None])[0]
+            if _MockAPI.paginate:
+                if cursor == "p2":
+                    self._send(
+                        200,
+                        {"machines": [{"id": "m2", "state": "running"}], "next_cursor": None},
+                    )
+                else:
+                    self._send(
+                        200,
+                        {"machines": [{"id": "m1", "state": "running"}], "next_cursor": "p2"},
+                    )
+                return
+            items = list(_MockAPI.machines.values())
+            self._send(200, {"machines": items, "next_cursor": None})
             return
 
         if method == "POST" and path == "/v1/volumes":
@@ -235,6 +291,8 @@ class SDKTest(unittest.TestCase):
         _MockAPI.fail_queue = []
         _MockAPI.idem_create.clear()
         _MockAPI.volumes_null = False
+        _MockAPI.paginate = False
+        _MockAPI.drop_count = 0
         _MockAPI.jobs.clear()
         # isolate env
         self._env = os.environ.copy()
@@ -513,6 +571,101 @@ class SDKTest(unittest.TestCase):
         self.assertEqual(parse_retry_after("12"), 12)
         self.assertIsNone(parse_retry_after("nope"))
         self.assertEqual(parse_retry_after("-1"), None)
+
+    def test_error_lifts_retryable_and_doc_url(self) -> None:
+        c = Client(api_key="k", base_url=self.base, max_retries=0)
+        _MockAPI.fail_next = {
+            "status": 409,
+            "body": {
+                "code": "too_many_execs",
+                "detail": "wait",
+                "retryable": True,
+                "doc_url": "https://docs.sistemo.io/errors/too_many_execs",
+            },
+        }
+        with self.assertRaises(APIError) as cm:
+            c.request("GET", "/v1/volumes")
+        self.assertIs(cm.exception.retryable, True)
+        self.assertEqual(
+            cm.exception.doc_url, "https://docs.sistemo.io/errors/too_many_execs"
+        )
+
+    def test_error_retryable_absent_is_none(self) -> None:
+        # Counter-guard: a missing field is not False. The API did not say.
+        c = Client(api_key="k", base_url=self.base, max_retries=0)
+        _MockAPI.fail_next = {"status": 500, "body": {"detail": "boom"}}
+        with self.assertRaises(APIError) as cm:
+            c.request("GET", "/v1/volumes")
+        self.assertIsNone(cm.exception.retryable)
+        self.assertIsNone(cm.exception.doc_url)
+
+    def test_error_retryable_false_stays_false(self) -> None:
+        err = APIError(400, "bad", "validation_error", {"retryable": False})
+        self.assertIs(err.retryable, False)
+
+    def test_list_volumes_page_keeps_next_cursor(self) -> None:
+        c = Client(api_key="k", base_url=self.base)
+        _MockAPI.paginate = True
+        page = c.list_volumes()
+        self.assertEqual(page[0]["id"], "v1")
+        self.assertEqual(page.next_cursor, "p2")
+        page2 = c.list_volumes(cursor=page.next_cursor, limit=1)
+        self.assertEqual(page2[0]["id"], "v2")
+        self.assertIsNone(page2.next_cursor)
+        last = _MockAPI.log[-1]
+        self.assertIn("cursor=p2", last["full_path"])
+        self.assertIn("limit=1", last["full_path"])
+
+    def test_iter_volumes_walks_pages(self) -> None:
+        c = Client(api_key="k", base_url=self.base)
+        _MockAPI.paginate = True
+        self.assertEqual([v["id"] for v in c.iter_volumes()], ["v1", "v2"])
+
+    def test_list_machines_and_iter(self) -> None:
+        c = Client(api_key="k", base_url=self.base)
+        _MockAPI.paginate = True
+        page = c.list_machines()
+        self.assertEqual(page[0]["id"], "m1")
+        self.assertEqual(page.next_cursor, "p2")
+        self.assertEqual([m["id"] for m in c.iter_machines()], ["m1", "m2"])
+
+    def test_remote_disconnected_is_sistemo_error_and_get_retries(self) -> None:
+        c = Client(api_key="k", base_url=self.base, max_retries=2, retry_backoff=0.01)
+        _MockAPI.drop_count = 1
+        vols = c.list_volumes()
+        self.assertEqual(vols[0]["id"], "v1")
+        self.assertEqual(sum(1 for x in _MockAPI.log if x["path"] == "/v1/volumes"), 2)
+
+
+class IncompleteBodyTest(unittest.TestCase):
+    """urlopen can succeed (headers) and then resp.read() raise IncompleteRead."""
+
+    def test_truncated_body_is_a_connection_error(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_a):
+                return
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"volumes":')
+                self.wfile.flush()
+                self.close_connection = True
+
+        srv = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        c = Client(
+            api_key="k",
+            base_url=f"http://127.0.0.1:{srv.server_port}",
+            max_retries=0,
+        )
+        with self.assertRaises(SistemoError) as cm:
+            c.list_volumes()
+        self.assertIn("connection error", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, APIError)
 
 
 if __name__ == "__main__":

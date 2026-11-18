@@ -146,6 +146,23 @@ class AsyncExecTest(unittest.TestCase):
         self.assertIsNone(j.exit_code)
         self.assertFalse(j.ok, "a lost job must never report ok — we do not know that it worked")
 
+    def test_run_lost_is_not_a_minus_one_exit(self):
+        """⚠ run() maps a null exit to -1; lost is what carries 'we cannot say'."""
+        SCENE["job"] = job_rec("lost")
+        SCENE["pages"] = [page(0, b"", eof=True)]
+        r = self.sandbox().run("whatever")
+        self.assertTrue(r.lost)
+        self.assertEqual(r.exit_code, -1)
+        self.assertFalse(r.ok)
+
+    def test_run_genuine_minus_one_is_not_lost(self):
+        SCENE["job"] = job_rec("failed", -1)
+        SCENE["pages"] = [page(0, b"", eof=True)]
+        r = self.sandbox().run("whatever")
+        self.assertFalse(r.lost)
+        self.assertEqual(r.exit_code, -1)
+        self.assertFalse(r.ok)
+
     def test_failed_job_is_done_but_not_ok(self):
         j = Job(self.sandbox(), job_rec("failed", 7))
         self.assertTrue(j.done)

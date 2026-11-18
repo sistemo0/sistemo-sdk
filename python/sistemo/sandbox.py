@@ -19,10 +19,21 @@ class ExecResult:
     stderr: str
     truncated: bool = False
     request_id: str | None = None
+    #: The machine could not account for this command.
+    #:
+    #: ⚠ When this is true, :attr:`exit_code` is a PLACEHOLDER (-1) and means
+    #: nothing — we can say neither that the command ran nor that it did not.
+    #: Without this flag a machine that died mid-command was indistinguishable
+    #: from a command that genuinely exited -1.
+    lost: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0
+        """True only for a command that finished and exited 0.
+
+        A lost command is never ok — we do not know that it worked.
+        """
+        return self.exit_code == 0 and not self.lost
 
 
 class Sandbox:
@@ -110,6 +121,9 @@ class Sandbox:
         except ExecStartUnconfirmed:
             job = self.job(eid)
         job.wait()
+        # ⚠ -1 is a placeholder for "unknown", not a real status. `lost` is what
+        # carries that fact; exit_code alone cannot, because -1 is also a status
+        # a real command can exit with.
         code = -1 if job.exit_code is None else job.exit_code
         return ExecResult(
             exit_code=code,
@@ -117,6 +131,7 @@ class Sandbox:
             stderr=job.logs("stderr"),
             truncated=job.truncated,
             request_id=job.request_id,
+            lost=job.lost,
         )
 
     def start(

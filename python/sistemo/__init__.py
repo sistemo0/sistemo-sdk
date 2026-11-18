@@ -17,7 +17,7 @@ For anything longer than a couple of minutes, start it and keep the handle::
         print(job.wait().exit_code)
 """
 
-from ._client import Client
+from ._client import Client, Page
 from ._version import __version__
 from .errors import (
     APIError,
@@ -39,6 +39,7 @@ __all__ = [
     "Job",
     "JobTimeout",
     "Client",
+    "Page",
     "SistemoError",
     "APIError",
     "AuthError",

@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.1.3";
+const USER_AGENT = "@sistemo/sdk/0.1.4";
 
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -37,6 +37,13 @@ export class APIError extends SistemoError {
   readonly body: Record<string, unknown>;
   /** Seconds from `Retry-After`, capped at 60. */
   readonly retryAfter?: number;
+  /**
+   * Whether sending the identical request again later can succeed without
+   * changing anything (from the API; `undefined` when it did not say).
+   */
+  readonly retryable?: boolean;
+  /** The docs entry for `code` — what it means and what to do. */
+  readonly docUrl?: string;
   private readonly explicitRequestId?: string;
   constructor(
     status: number,
@@ -53,6 +60,8 @@ export class APIError extends SistemoError {
     this.body = body ?? {};
     this.retryAfter = extra?.retryAfter;
     this.explicitRequestId = extra?.requestId;
+    this.retryable = typeof this.body.retryable === "boolean" ? this.body.retryable : undefined;
+    this.docUrl = typeof this.body.doc_url === "string" && this.body.doc_url ? this.body.doc_url : undefined;
   }
   get requestId(): string | undefined {
     if (this.explicitRequestId) return this.explicitRequestId;
@@ -153,6 +162,16 @@ function newIdempotencyKey(): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Append `limit` / `cursor` when set. The API names the query `cursor`. */
+function withQuery(path: string, opts?: { cursor?: string; limit?: number }): string {
+  if (!opts) return path;
+  const q = new URLSearchParams();
+  if (opts.cursor) q.set("cursor", opts.cursor);
+  if (opts.limit != null) q.set("limit", String(opts.limit));
+  const s = q.toString();
+  return s ? `${path}?${s}` : path;
 }
 
 const RETRY_AFTER_CAP_SEC = 60;
@@ -291,6 +310,7 @@ export class Client {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     let res: Response;
+    let text: string;
     try {
       const headers: Record<string, string> = {
         Authorization: `Bearer ${this.apiKey}`,
@@ -308,13 +328,15 @@ export class Client {
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
+      // ⚠ Keep the abort live through the body read. Clearing it when fetch()
+      // resolves (headers only) left a hung body waiting on Node's default
+      // undici bodyTimeout — 300 s. That is the slow-response hang.
+      text = await res.text();
     } catch (e) {
       throw new SistemoError(`connection error: ${(e as Error).message}`);
     } finally {
       clearTimeout(timer);
     }
-
-    const text = await res.text();
     if (!res.ok) {
       let detail = "request failed";
       let code: string | undefined;
@@ -359,10 +381,59 @@ export class Client {
 
   // --- volumes (incl. detachable root volumes) ---------------------------
 
-  /** List the account's volumes (root and data). */
-  async listVolumes(): Promise<{ volumes: Volume[] }> {
-    const out = await this.request<{ volumes?: Volume[] | null }>("GET", "/v1/volumes");
-    return { volumes: out.volumes ?? [] };
+  /**
+   * List the account's volumes (root and data).
+   *
+   * `nextCursor` is `null` on the last page; pass it back as `{ cursor }` for
+   * the next one. Walk every page with {@link iterVolumes}.
+   */
+  async listVolumes(opts?: { cursor?: string; limit?: number }): Promise<{
+    volumes: Volume[];
+    nextCursor: string | null;
+  }> {
+    const out = await this.request<{ volumes?: Volume[] | null; next_cursor?: string | null }>(
+      "GET",
+      withQuery("/v1/volumes", opts),
+    );
+    return { volumes: out.volumes ?? [], nextCursor: out.next_cursor ?? null };
+  }
+
+  /** Yield every volume, following `nextCursor` until the last page. */
+  async *iterVolumes(opts?: { limit?: number }): AsyncGenerator<Volume> {
+    yield* this.iterPages((cursor) => this.listVolumes({ cursor, limit: opts?.limit }), (p) => p.volumes);
+  }
+
+  /**
+   * List the account's machines. Same paging contract as {@link listVolumes}.
+   */
+  async listMachines(opts?: { cursor?: string; limit?: number }): Promise<{
+    machines: Machine[];
+    nextCursor: string | null;
+  }> {
+    const out = await this.request<{ machines?: Machine[] | null; next_cursor?: string | null }>(
+      "GET",
+      withQuery("/v1/machines", opts),
+    );
+    return { machines: out.machines ?? [], nextCursor: out.next_cursor ?? null };
+  }
+
+  /** Yield every machine, following `nextCursor` until the last page. */
+  async *iterMachines(opts?: { limit?: number }): AsyncGenerator<Machine> {
+    yield* this.iterPages((cursor) => this.listMachines({ cursor, limit: opts?.limit }), (p) => p.machines);
+  }
+
+  private async *iterPages<T, P extends { nextCursor: string | null }>(
+    fetch: (cursor?: string) => Promise<P>,
+    items: (page: P) => T[],
+  ): AsyncGenerator<T> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await fetch(cursor);
+      for (const item of items(page)) yield item;
+      const nxt = page.nextCursor;
+      if (!nxt || nxt === cursor) return;
+      cursor = nxt;
+    }
   }
 
   /** Create a standalone data volume. */
@@ -413,12 +484,31 @@ export interface Volume {
   machine_id?: string;
 }
 
+export interface Machine {
+  id: string;
+  name?: string;
+  state: string;
+  vcpus?: number;
+  memory_mb?: number;
+  rootfs_size_gb?: number;
+  stack?: string;
+}
+
 export interface ExecResult {
   exitCode: number;
   stdout: string;
   stderr: string;
   truncated?: boolean;
   requestId?: string;
+  /**
+   * The machine could not account for this command.
+   *
+   * ⚠ When true, `exitCode` is a PLACEHOLDER (-1) and means nothing — we can
+   * say neither that the command ran nor that it did not. Without this flag a
+   * machine that died mid-command is indistinguishable from a command that
+   * genuinely exited -1.
+   */
+  lost?: boolean;
 }
 
 export interface SandboxOptions extends ClientOptions {
@@ -501,12 +591,16 @@ export class Sandbox {
     }
     await job.wait();
     const dec = new TextDecoder("utf-8");
+    // ⚠ -1 is a placeholder for "unknown", not a real status. `lost` is what
+    // carries that fact; exitCode alone cannot, because -1 is also a status a
+    // real command can exit with.
     return {
       exitCode: job.exitCode ?? -1,
       stdout: dec.decode(await job.output("stdout")),
       stderr: dec.decode(await job.output("stderr")),
       truncated: job.truncated,
       requestId: job.requestId,
+      lost: job.lost,
     };
   }
 

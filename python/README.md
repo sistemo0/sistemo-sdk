@@ -56,7 +56,7 @@ Or pass them explicitly: `Sandbox(api_key="sk_live_…", base_url="https://…")
 ```python
 sb = Sandbox(vcpus=1, memory_mb=1024, stack="base")  # provisions a microVM
 res = sb.run("echo hi && uname -a")                        # -> ExecResult (default 120s, max 24h)
-res.stdout, res.stderr, res.exit_code, res.ok, res.truncated, res.request_id
+res.stdout, res.stderr, res.exit_code, res.ok, res.truncated, res.request_id, res.lost
 sb.run("python3 app.py", env={"FOO": "bar"}, cwd="/tmp")   # env/cwd omitted unless set
 sb.close()                                                 # destroy (or use `with`)
 ```
@@ -79,7 +79,7 @@ except QuotaExceededError as e:
 except AuthError:
     ...          # 401/403 — key missing/invalid/revoked, or read-only key
 except APIError as e:
-    print(e.status, e.detail, e.code, e.request_id)
+    print(e.status, e.detail, e.code, e.request_id, e.retryable, e.doc_url)
 ```
 
 Both `QuotaExceededError` and `AuthError` arrive as HTTP 403, so **catch
@@ -90,8 +90,25 @@ every limit alongside current usage.
 
 Every request sends `X-Request-Id`. Quote `e.request_id` when you contact support.
 On `429`, the client honours `Retry-After` (capped at 60 s) from version 0.1.3.
+`e.retryable` and `e.doc_url` come from the API body when it sent them (`None` if it did not).
 
 Zero runtime dependencies (Python stdlib only). Apache-2.0.
+
+## List machines and volumes
+
+Lists are keyset-paginated. `list_volumes()` / `list_machines()` return a
+`Page` (a list with `next_cursor`; `None` means the last page). Index it like a
+list; walk every page with `iter_volumes()` / `iter_machines()`.
+
+```python
+from sistemo import Client
+
+c = Client()
+page = c.list_volumes()          # page[0]["id"], page.next_cursor
+page = c.list_volumes(cursor=page.next_cursor, limit=50)
+for vol in c.iter_volumes():
+    print(vol["id"])
+```
 
 ## Long-running commands
 
