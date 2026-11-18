@@ -79,6 +79,16 @@ class QuotaExceededError(APIError):
     """
 
 
+class InsufficientBalanceError(APIError):
+    """402 `insufficient_balance` — the prepaid wallet cannot cover this.
+
+    Distinct from :class:`QuotaExceededError` (free a resource and retry) and
+    from :class:`AuthError` (the key is fine). Top up; freeing machines does
+    not help. Anything that creates ongoing cost — a machine create or start,
+    a volume, a snapshot — is refused this way.
+    """
+
+
 class NotFoundError(APIError):
     """404 — the resource does not exist (or isn't yours)."""
 
@@ -139,6 +149,8 @@ def api_error(
     # 403 is two different things, told apart by `code` — never by the status.
     if status == 403 and code == "quota_exceeded":
         return QuotaExceededError(status, detail, code, body, **kw)
+    if status == 402:
+        return InsufficientBalanceError(status, detail, code, body, **kw)
     if status in (401, 403):
         return AuthError(status, detail, code, body, **kw)
     if status == 404:

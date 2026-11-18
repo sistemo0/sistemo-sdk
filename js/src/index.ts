@@ -89,6 +89,16 @@ export class AuthError extends APIError {}
  */
 export class QuotaExceededError extends APIError {}
 
+/**
+ * 402 `insufficient_balance` — the prepaid wallet cannot cover this.
+ *
+ * Distinct from `QuotaExceededError` (free a resource and retry) and from
+ * `AuthError` (the key is fine). Top up; freeing machines does not help.
+ * Anything that creates ongoing cost — a machine create or start, a volume, a
+ * snapshot — is refused this way.
+ */
+export class InsufficientBalanceError extends APIError {}
+
 /** 404 — resource not found (or not yours). */
 export class NotFoundError extends APIError {}
 /** 429 — rate limited. */
@@ -141,6 +151,7 @@ function apiError(
 ): APIError {
   // 403 is two different things, told apart by `code` — never by the status.
   if (status === 403 && code === "quota_exceeded") return new QuotaExceededError(status, detail, code, body, extra);
+  if (status === 402) return new InsufficientBalanceError(status, detail, code, body, extra);
   if (status === 401 || status === 403) return new AuthError(status, detail, code, body, extra);
   if (status === 404) return new NotFoundError(status, detail, code, body, extra);
   if (status === 410) return new GoneError(status, detail, code, body, extra);
@@ -358,7 +369,20 @@ export class Client {
       if (!requestId) requestId = res.headers.get("X-Request-Id") ?? this.lastRequestId;
       throw apiError(res.status, detail, code, body, { retryAfter, requestId: requestId ?? undefined });
     }
-    return (text ? JSON.parse(text) : {}) as T;
+    // ⚠ JSON.parse after a 2xx used to sit outside the fetch try/catch, so a
+    // proxy HTML 200 leaked SyntaxError — not a SistemoError, and GET did not
+    // retry. A 200 whose body is `null` or an array is the same class of lie:
+    // this API's 2xx bodies are objects.
+    let parsed: unknown;
+    try {
+      parsed = text ? JSON.parse(text) : {};
+    } catch (e) {
+      throw new SistemoError(`invalid JSON response: ${(e as Error).message}`);
+    }
+    if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new SistemoError("invalid JSON response: expected an object");
+    }
+    return parsed as T;
   }
 
   private shouldRetryHttp(
@@ -494,12 +518,17 @@ export interface Machine {
   stack?: string;
 }
 
+/** One page of `jobs()`. A real array plus `nextCursor`. */
+export type JobPage = Job[] & { nextCursor: string | null };
+
 export interface ExecResult {
   exitCode: number;
   stdout: string;
   stderr: string;
   truncated?: boolean;
   requestId?: string;
+  /** True only for a command that finished and exited 0. A lost command is never ok. */
+  ok?: boolean;
   /**
    * The machine could not account for this command.
    *
@@ -568,6 +597,31 @@ export class Sandbox {
   }
 
   /**
+   * Re-attach to an existing machine — after a crash, or from a stored id.
+   *
+   * Does **not** provision a new microVM. The machine must still exist
+   * (a 404 is {@link NotFoundError}).
+   */
+  static async connect(id: string, opts: SandboxOptions = {}): Promise<Sandbox> {
+    if (!id) {
+      throw new SistemoError("machine id is required");
+    }
+    const client = opts.client ?? new Client(opts);
+    const machine = await client.request<{ id?: string; state?: string }>(
+      "GET",
+      `/v1/machines/${id}`,
+    );
+    if (!machine?.id) {
+      throw new APIError(
+        502,
+        "machine response missing id — refusing to continue",
+        "invalid_machine_response",
+      );
+    }
+    return new Sandbox(client, machine.id, machine.state ?? "");
+  }
+
+  /**
    * Run a shell command/script inside the sandbox and return its output.
    *
    * This is start + wait on a guest job (`POST /execs`). Default timeout 120s,
@@ -594,13 +648,16 @@ export class Sandbox {
     // ⚠ -1 is a placeholder for "unknown", not a real status. `lost` is what
     // carries that fact; exitCode alone cannot, because -1 is also a status a
     // real command can exit with.
+    const exitCode = job.exitCode ?? -1;
+    const lost = job.lost;
     return {
-      exitCode: job.exitCode ?? -1,
+      exitCode,
       stdout: dec.decode(await job.output("stdout")),
       stderr: dec.decode(await job.output("stderr")),
       truncated: job.truncated,
       requestId: job.requestId,
-      lost: job.lost,
+      lost,
+      ok: exitCode === 0 && !lost,
     };
   }
 
@@ -668,13 +725,33 @@ export class Sandbox {
     return new Job(this.client, this.id, rec);
   }
 
-  /** List this sandbox's async jobs, newest first. */
-  async jobs(limit = 50): Promise<Job[]> {
-    const out = await this.client.request<{ execs?: JobRecord[] }>(
+  /**
+   * List this sandbox's async jobs, newest first.
+   *
+   * A list with `nextCursor` (`null` on the last page), so `jobs[0]` and
+   * `for (const j of jobs)` keep working. The guest keeps at most 64, so the
+   * default page holds them all. Walk every page with {@link iterJobs}.
+   */
+  async jobs(limit = 100, opts?: { cursor?: string }): Promise<JobPage> {
+    const out = await this.client.request<{ execs?: JobRecord[] | null; next_cursor?: string | null }>(
       "GET",
-      `/v1/machines/${this.id}/execs?limit=${limit}`,
+      withQuery(`/v1/machines/${this.id}/execs`, { cursor: opts?.cursor, limit }),
     );
-    return (out.execs ?? []).map((r) => new Job(this.client, this.id, r));
+    const jobs = (out.execs ?? []).map((r) => new Job(this.client, this.id, r)) as JobPage;
+    jobs.nextCursor = out.next_cursor ?? null;
+    return jobs;
+  }
+
+  /** Yield every job on this sandbox, following `nextCursor`. */
+  async *iterJobs(opts?: { limit?: number }): AsyncGenerator<Job> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.jobs(opts?.limit ?? 100, { cursor });
+      for (const job of page) yield job;
+      const nxt = page.nextCursor;
+      if (!nxt || nxt === cursor) return;
+      cursor = nxt;
+    }
   }
 
   /** Destroy the sandbox (and its disk unless `preserveStorage`). */

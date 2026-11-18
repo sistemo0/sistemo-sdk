@@ -94,6 +94,25 @@ class Page(list):
         return f"Page({list.__repr__(self)}, next_cursor={self.next_cursor!r})"
 
 
+def _json_object(raw: bytes) -> Any:
+    """Parse a 2xx JSON object. Empty body → {}. Anything else is a connection-class error.
+
+    ⚠ ``json.loads`` on HTML (a proxy 200, a truncated body that still parsed as
+    bytes) used to leak ``JSONDecodeError`` — not a :class:`SistemoError`, and
+    GET did not retry. A 200 whose body is ``null`` or an array is the same
+    class of lie: this API's 2xx bodies are objects.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise SistemoError(f"invalid JSON response: {e}") from e
+    if not isinstance(parsed, dict):
+        raise SistemoError("invalid JSON response: expected an object")
+    return parsed
+
+
 def _qs(path: str, **params: Any) -> str:
     """Append ``limit`` / ``cursor`` (and any other query) when they are set."""
     pairs = []
@@ -217,9 +236,14 @@ class Client:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read()
-                return json.loads(raw) if raw else {}
+                return _json_object(raw)
         except urllib.error.HTTPError as e:
-            raw = e.read()
+            # ⚠ e.read() can IncompleteRead the same way resp.read() can.
+            # Leaving it uncaught leaked a stdlib type and skipped retry on 5xx.
+            try:
+                raw = e.read()
+            except (http.client.HTTPException, ConnectionError, OSError):
+                raw = b""
             detail, code, parsed = "request failed", None, None
             try:
                 parsed = json.loads(raw)

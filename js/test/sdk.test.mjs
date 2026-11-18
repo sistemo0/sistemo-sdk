@@ -12,6 +12,7 @@ import {
   Client,
   NotFoundError,
   QuotaExceededError,
+  InsufficientBalanceError,
   RateLimitError,
   Sandbox,
   SistemoError,
@@ -134,6 +135,28 @@ before(async () => {
       return;
     }
 
+    if (method === "GET" && path.endsWith("/execs")) {
+      const id = path.split("/")[3];
+      const cursor = url.searchParams.get("cursor");
+      if (state.paginate) {
+        if (cursor === "p2") {
+          send(res, 200, {
+            execs: [{ exec_id: "e2", machine_id: id, state: "succeeded", exit_code: 0 }],
+            next_cursor: null,
+          });
+        } else {
+          send(res, 200, {
+            execs: [{ exec_id: "e1", machine_id: id, state: "succeeded", exit_code: 0 }],
+            next_cursor: "p2",
+          });
+        }
+        return;
+      }
+      const items = [...state.jobs.values()].filter((j) => j.rec?.machine_id === id).map((j) => j.rec);
+      send(res, 200, { execs: items, next_cursor: null });
+      return;
+    }
+
     if (method === "GET" && path.includes("/execs/") && path.endsWith("/output")) {
       const eid = path.split("/")[5];
       const job = state.jobs.get(eid) || {};
@@ -197,6 +220,17 @@ before(async () => {
         return;
       }
       send(res, 200, { machines: [...state.machines.values()], next_cursor: null });
+      return;
+    }
+
+    if (method === "GET" && path.startsWith("/v1/machines/") && !path.includes("/execs")) {
+      const id = path.split("/")[3];
+      const m = state.machines.get(id);
+      if (!m) {
+        send(res, 404, { detail: "not found", code: "not_found" });
+        return;
+      }
+      send(res, 200, m);
       return;
     }
 
@@ -367,6 +401,7 @@ describe("Sandbox", () => {
 
     const r = await sb.run("echo hi");
     assert.equal(r.exitCode, 0);
+    assert.equal(r.ok, true);
     assert.equal(r.stdout, "out:echo hi");
     const ex = state.log.find((l) => l.path.endsWith("/execs"));
     assert.equal(ex.body.script, "echo hi");
@@ -472,6 +507,48 @@ describe("Sandbox", () => {
     const bare = state.log.find((l) => l.path.endsWith("/execs") && l.method === "POST");
     assert.equal(bare.body.env, undefined);
     assert.equal(bare.body.cwd, undefined);
+  });
+
+  it("jobs page keeps nextCursor", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.paginate = true;
+    const page = await sb.jobs(1);
+    assert.equal(page[0].id, "e1");
+    assert.equal(page.nextCursor, "p2");
+    const page2 = await sb.jobs(1, { cursor: page.nextCursor });
+    assert.equal(page2[0].id, "e2");
+    assert.equal(page2.nextCursor, null);
+    const last = state.log.at(-1);
+    assert.match(last.fullPath, /cursor=p2/);
+    assert.match(last.fullPath, /limit=1/);
+  });
+
+  it("iterJobs walks pages", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.paginate = true;
+    const ids = [];
+    for await (const j of sb.iterJobs({ limit: 1 })) ids.push(j.id);
+    assert.deepEqual(ids, ["e1", "e2"]);
+  });
+
+  it("connect does not create", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    const posts = state.log.filter((l) => l.method === "POST" && l.path === "/v1/machines").length;
+    const sb2 = await Sandbox.connect(sb.id, { apiKey: "k", baseUrl });
+    assert.equal(sb2.id, sb.id);
+    assert.equal(sb2.state, "running");
+    const posts2 = state.log.filter((l) => l.method === "POST" && l.path === "/v1/machines").length;
+    assert.equal(posts2, posts);
+    assert.ok(state.log.some((l) => l.method === "GET" && l.path === `/v1/machines/${sb.id}`));
+    const r = await sb2.run("echo hi");
+    assert.equal(r.ok, true);
+  });
+
+  it("connect missing is NotFoundError", async () => {
+    await assert.rejects(
+      () => Sandbox.connect("nope", { apiKey: "k", baseUrl }),
+      (e) => e instanceof NotFoundError,
+    );
   });
 });
 
@@ -599,6 +676,55 @@ describe("hung body", () => {
   });
 });
 
+describe("invalid JSON 200", () => {
+  // JSON.parse sat outside the fetch try/catch, so a proxy HTML 200 leaked
+  // SyntaxError — not a SistemoError, and GET did not retry.
+  it("html 200 is a SistemoError", async () => {
+    const srv = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end("<html>nope</html>");
+    });
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    try {
+      const c = new Client({
+        apiKey: "k",
+        baseUrl: `http://127.0.0.1:${srv.address().port}`,
+        maxRetries: 0,
+      });
+      await assert.rejects(() => c.listVolumes(), (err) => {
+        assert.ok(err instanceof SistemoError);
+        assert.ok(!(err instanceof APIError));
+        assert.match(err.message, /invalid JSON/);
+        return true;
+      });
+    } finally {
+      await new Promise((r) => srv.close(r));
+    }
+  });
+
+  it("json null 200 is a SistemoError", async () => {
+    const srv = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("null");
+    });
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    try {
+      const c = new Client({
+        apiKey: "k",
+        baseUrl: `http://127.0.0.1:${srv.address().port}`,
+        maxRetries: 0,
+      });
+      await assert.rejects(() => c.listVolumes(), (err) => {
+        assert.ok(err instanceof SistemoError);
+        assert.match(err.message, /expected an object/);
+        return true;
+      });
+    } finally {
+      await new Promise((r) => srv.close(r));
+    }
+  });
+});
+
 
 describe("quota error mapping", () => {
   // A quota refusal must NOT surface as an auth failure. Both arrive as 403, but
@@ -647,6 +773,43 @@ describe("quota error mapping", () => {
       const c = new Client({ apiKey: "sk_test", baseUrl: base });
       await assert.rejects(() => c.listVolumes(), (err) => err instanceof APIError);
     }
+  });
+});
+
+describe("insufficient balance mapping", () => {
+  let srv, base;
+
+  before(async () => {
+    srv = createServer((_req, res) => {
+      res.writeHead(402, { "content-type": "application/json" });
+      res.end(JSON.stringify({ code: "insufficient_balance", detail: "balance is 0" }));
+    });
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    base = `http://127.0.0.1:${srv.address().port}`;
+  });
+  after(() => srv.close());
+
+  it("raises InsufficientBalanceError for 402", async () => {
+    const c = new Client({ apiKey: "sk_test", baseUrl: base, maxRetries: 0 });
+    await assert.rejects(() => c.listVolumes(), (err) => {
+      assert.ok(err instanceof InsufficientBalanceError);
+      assert.ok(!(err instanceof AuthError));
+      assert.ok(!(err instanceof QuotaExceededError));
+      assert.ok(err instanceof APIError);
+      return true;
+    });
+  });
+});
+
+describe("409 is not a balance error", () => {
+  it("exec_id_in_use stays a plain APIError", async () => {
+    const c = new Client({ apiKey: "k", baseUrl, maxRetries: 0 });
+    state.failNext = { status: 409, body: { code: "exec_id_in_use", detail: "in use" } };
+    await assert.rejects(() => c.listVolumes(), (err) => {
+      assert.ok(err instanceof APIError);
+      assert.ok(!(err instanceof InsufficientBalanceError));
+      return true;
+    });
   });
 });
 

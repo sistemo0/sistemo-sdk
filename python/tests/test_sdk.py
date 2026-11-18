@@ -17,6 +17,7 @@ import unittest
 from sistemo.errors import (
     APIError,
     AuthError,
+    InsufficientBalanceError,
     QuotaExceededError,
     api_error,
 )
@@ -175,6 +176,49 @@ class _MockAPI(BaseHTTPRequestHandler):
             self._send(202, rec)
             return
 
+        if method == "GET" and path.endswith("/execs"):
+            mid = path.split("/")[3]
+            cursor = (parse_qs(urlparse(full_path).query).get("cursor") or [None])[0]
+            if _MockAPI.paginate:
+                if cursor == "p2":
+                    self._send(
+                        200,
+                        {
+                            "execs": [
+                                {
+                                    "exec_id": "e2",
+                                    "machine_id": mid,
+                                    "state": "succeeded",
+                                    "exit_code": 0,
+                                }
+                            ],
+                            "next_cursor": None,
+                        },
+                    )
+                else:
+                    self._send(
+                        200,
+                        {
+                            "execs": [
+                                {
+                                    "exec_id": "e1",
+                                    "machine_id": mid,
+                                    "state": "succeeded",
+                                    "exit_code": 0,
+                                }
+                            ],
+                            "next_cursor": "p2",
+                        },
+                    )
+                return
+            items = [
+                j["rec"]
+                for j in _MockAPI.jobs.values()
+                if j["rec"].get("machine_id") == mid
+            ]
+            self._send(200, {"execs": items, "next_cursor": None})
+            return
+
         if method == "GET" and "/execs/" in path and path.endswith("/output"):
             eid = path.split("/")[5]
             job = _MockAPI.jobs.get(eid, {})
@@ -258,6 +302,15 @@ class _MockAPI(BaseHTTPRequestHandler):
                 return
             items = list(_MockAPI.machines.values())
             self._send(200, {"machines": items, "next_cursor": None})
+            return
+
+        if method == "GET" and path.startswith("/v1/machines/") and "/execs" not in path:
+            mid = path.split("/")[3]
+            m = _MockAPI.machines.get(mid)
+            if not m:
+                self._send(404, {"detail": "not found", "code": "not_found"})
+                return
+            self._send(200, m)
             return
 
         if method == "POST" and path == "/v1/volumes":
@@ -636,6 +689,53 @@ class SDKTest(unittest.TestCase):
         self.assertEqual(vols[0]["id"], "v1")
         self.assertEqual(sum(1 for x in _MockAPI.log if x["path"] == "/v1/volumes"), 2)
 
+    def test_jobs_page_keeps_next_cursor(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.paginate = True
+        page = sb.jobs(limit=1)
+        self.assertEqual(page[0].id, "e1")
+        self.assertEqual(page.next_cursor, "p2")
+        page2 = sb.jobs(limit=1, cursor=page.next_cursor)
+        self.assertEqual(page2[0].id, "e2")
+        self.assertIsNone(page2.next_cursor)
+        last = _MockAPI.log[-1]
+        self.assertIn("cursor=p2", last["full_path"])
+        self.assertIn("limit=1", last["full_path"])
+
+    def test_iter_jobs_walks_pages(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.paginate = True
+        self.assertEqual([j.id for j in sb.iter_jobs(limit=1)], ["e1", "e2"])
+
+    def test_connect_does_not_create(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        mid = sb.id
+        posts = sum(
+            1
+            for x in _MockAPI.log
+            if x["method"] == "POST" and x["path"] == "/v1/machines"
+        )
+        sb2 = Sandbox.connect(mid, api_key="k", base_url=self.base)
+        self.assertEqual(sb2.id, mid)
+        self.assertEqual(sb2.state, "running")
+        posts2 = sum(
+            1
+            for x in _MockAPI.log
+            if x["method"] == "POST" and x["path"] == "/v1/machines"
+        )
+        self.assertEqual(posts2, posts)
+        self.assertTrue(
+            any(
+                x["method"] == "GET" and x["path"] == f"/v1/machines/{mid}"
+                for x in _MockAPI.log
+            )
+        )
+        self.assertTrue(sb2.run("echo hi").ok)
+
+    def test_connect_missing_is_not_found(self) -> None:
+        with self.assertRaises(NotFoundError):
+            Sandbox.connect("nope", api_key="k", base_url=self.base)
+
 
 class IncompleteBodyTest(unittest.TestCase):
     """urlopen can succeed (headers) and then resp.read() raise IncompleteRead."""
@@ -668,6 +768,78 @@ class IncompleteBodyTest(unittest.TestCase):
         self.assertNotIsInstance(cm.exception, APIError)
 
 
+class InvalidJSONTest(unittest.TestCase):
+    """A 200 whose body is not a JSON object must be SistemoError, not a stdlib leak."""
+
+    def _client(self, handler) -> Client:
+        srv = HTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return Client(
+            api_key="k",
+            base_url=f"http://127.0.0.1:{srv.server_port}",
+            max_retries=0,
+        )
+
+    def test_html_200_is_sistemo_error(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_a):
+                return
+
+            def do_GET(self):
+                raw = b"<html>nope</html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        c = self._client(Handler)
+        with self.assertRaises(SistemoError) as cm:
+            c.list_volumes()
+        self.assertIn("invalid JSON", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, APIError)
+
+    def test_json_null_200_is_sistemo_error(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_a):
+                return
+
+            def do_GET(self):
+                raw = b"null"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        c = self._client(Handler)
+        with self.assertRaises(SistemoError) as cm:
+            c.list_volumes()
+        self.assertIn("expected an object", str(cm.exception))
+
+    def test_truncated_5xx_body_keeps_the_status(self) -> None:
+        # e.read() IncompleteRead used to leak. We still know the status, so
+        # this stays an APIError 500 (GET retries) rather than a connection error.
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_a):
+                return
+
+            def do_GET(self):
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"detail":')
+                self.wfile.flush()
+                self.close_connection = True
+
+        c = self._client(Handler)
+        with self.assertRaises(APIError) as cm:
+            c.list_volumes()
+        self.assertEqual(cm.exception.status, 500)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -697,6 +869,20 @@ class QuotaErrorMappingTest(unittest.TestCase):
     def test_both_remain_catchable_as_apierror(self):
         for code in ("quota_exceeded", "forbidden"):
             self.assertIsInstance(api_error(403, "x", code), APIError)
+
+    def test_insufficient_balance_is_its_own_type(self):
+        err = api_error(402, "balance is 0", "insufficient_balance")
+        self.assertIsInstance(err, InsufficientBalanceError)
+        self.assertNotIsInstance(err, AuthError)
+        self.assertNotIsInstance(err, QuotaExceededError)
+        self.assertIsInstance(err, APIError)
+
+    def test_a_409_is_not_insufficient_balance(self):
+        # Counter-guard: 402 used to be 409 conflict. Branching on "any 409"
+        # would catch a reused exec_id as "please top up".
+        err = api_error(409, "exec_id already in use", "exec_id_in_use")
+        self.assertNotIsInstance(err, InsufficientBalanceError)
+        self.assertIsInstance(err, APIError)
 
 
 class VersionDriftTest(unittest.TestCase):

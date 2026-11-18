@@ -49,7 +49,7 @@ Or pass them explicitly: `Sandbox.create({ apiKey: "sk_live_…", baseUrl: "http
 
 ```ts
 const sb = await Sandbox.create({ vcpus: 1, memoryMb: 1024, stack: "base" });
-const res = await sb.run("echo hi && uname -a");     // -> { exitCode, stdout, stderr, truncated, requestId, lost } (default 120s, max 24h)
+const res = await sb.run("echo hi && uname -a");     // -> { exitCode, stdout, stderr, truncated, requestId, lost, ok } (default 120s, max 24h)
 await sb.run("node app.js", 120, { env: { FOO: "bar" }, cwd: "/tmp" });
 await sb.close();                                    // destroy
 ```
@@ -59,7 +59,7 @@ A **read** API key can list resources but cannot create sandboxes or run code �
 ## Errors
 
 ```ts
-import { APIError, AuthError, QuotaExceededError } from "@sistemo/sdk";
+import { APIError, AuthError, InsufficientBalanceError, QuotaExceededError } from "@sistemo/sdk";
 
 try {
   const sb = await Sandbox.create();
@@ -69,6 +69,7 @@ try {
   // they need opposite handling: an auth failure never succeeds on retry, a
   // quota refusal does once you free the resource it names.
   if (e instanceof QuotaExceededError) { console.log(e.detail); }
+  else if (e instanceof InsufficientBalanceError) { /* 402 — top up; freeing machines does not help */ }
   else if (e instanceof AuthError) { /* 401/403 — key invalid or read-only */ }
   else if (e instanceof APIError) { console.log(e.status, e.detail, e.code, e.requestId, e.retryable, e.docUrl); }
 }
@@ -76,7 +77,8 @@ try {
 
 `QuotaExceededError` means an account limit was reached; `detail` names which
 dimension bound and how much is in use, and `GET /v1/quotas` reports every limit
-alongside current usage.
+alongside current usage. `InsufficientBalanceError` is HTTP 402 (top up); it is
+not a quota refusal and not an auth failure.
 
 Every request sends `X-Request-Id`. Quote `e.requestId` when you contact support.
 On `429`, the client honours `Retry-After` (capped at 60 s) from version 0.1.3.
@@ -135,8 +137,17 @@ try {
 }
 ```
 
-The handle outlives the process that created it, so a crashed client can
-reconnect with `sb.job(execId)` or list what is running with `sb.jobs()`.
+The handle outlives the process that created it. Reconnect with
+`Sandbox.connect(machineId)` (does not provision a new microVM), then
+`sb.job(execId)` or `sb.jobs()` / `sb.iterJobs()`. `jobs()` is a real array
+plus `nextCursor`; the guest keeps at most 64, so the default page holds them
+all.
+
+```ts
+const sb = await Sandbox.connect(machineId);  // GET /v1/machines/{id}
+const job = await sb.job(execId);
+await job.wait();
+```
 
 ### Three things worth knowing
 
