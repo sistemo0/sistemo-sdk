@@ -210,22 +210,27 @@ describe("start semantics", () => {
     assert.equal((scene.starts ?? []).length, 1);
   });
 
-  it("too_many_execs is not recovered by GET", async () => {
-    const { APIError } = await import("../dist/index.js");
-    scene.startStatus = 409;
-    scene.startBody = {
-      code: "too_many_execs",
-      detail: "the machine is already running its maximum number of concurrent commands",
-    };
-    scene.job = jobRec("running");
-    const sb = await newSandbox();
-    await assert.rejects(() => sb.start("echo hi"), (err) => {
-      assert.ok(err instanceof APIError);
-      assert.equal(err.code, "too_many_execs");
-      return true;
+  for (const [code, name] of [
+    ["too_many_execs", "TooManyExecsError"],
+    ["machine_process_limit", "ProcessLimitError"],
+    ["machine_disk_full", "DiskFullError"],
+    ["machine_out_of_memory", "OutOfMemoryError"],
+    ["machine_not_running", "MachineNotRunningError"],
+  ]) {
+    it(`${code} is not recovered by GET`, async () => {
+      const errors = await import("../dist/index.js");
+      scene.startStatus = 409;
+      scene.startBody = { code, detail: "x" };
+      scene.job = jobRec("running");
+      const sb = await newSandbox();
+      await assert.rejects(() => sb.start("echo hi"), (err) => {
+        assert.ok(err instanceof errors[name], `${code} should be ${name}`);
+        assert.equal(err.code, code);
+        return true;
+      });
+      assert.equal((scene.gets ?? []).length, 0);
     });
-    assert.equal((scene.gets ?? []).length, 0);
-  });
+  }
 
   it("start sends env only when set", async () => {
     scene.job = jobRec("running");

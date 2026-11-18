@@ -13,9 +13,14 @@ import {
   NotFoundError,
   QuotaExceededError,
   InsufficientBalanceError,
+  DiskFullError,
+  MachineNotRunningError,
+  OutOfMemoryError,
+  ProcessLimitError,
   RateLimitError,
   Sandbox,
   SistemoError,
+  TooManyExecsError,
   parseRetryAfter,
   retryDelayMs,
 } from "../dist/index.js";
@@ -30,6 +35,7 @@ const state = {
   paginate: false,
   dropCount: 0,
   jobs: new Map(),
+  jobGone: null,
 };
 
 function readBody(req) {
@@ -70,18 +76,20 @@ before(async () => {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     const path = url.pathname;
     const fullPath = url.pathname + url.search;
-    const body = method === "POST" || method === "PUT" ? await readBody(req) : undefined;
     const auth = req.headers.authorization || "";
     const ua = req.headers["user-agent"] || "";
     const idem = req.headers["idempotency-key"] || "";
     const reqId = req.headers["x-request-id"] || "";
-    state.log.push({ method, path, fullPath, body, auth, ua: String(ua), idem: String(idem), reqId: String(reqId) });
-
+    // Drop BEFORE reading the body. A POST whose body is already consumed then
+    // destroyed waits on undici's headersTimeout (the client's timeoutMs).
     if (state.dropCount > 0) {
       state.dropCount -= 1;
+      state.log.push({ method, path, fullPath, body: undefined, auth, ua: String(ua), idem: String(idem), reqId: String(reqId) });
       req.destroy();
       return;
     }
+    const body = method === "POST" || method === "PUT" ? await readBody(req) : undefined;
+    state.log.push({ method, path, fullPath, body, auth, ua: String(ua), idem: String(idem), reqId: String(reqId) });
 
     if (state.failQueue.length) {
       const f = state.failQueue.shift();
@@ -93,6 +101,11 @@ before(async () => {
       const f = state.failNext;
       state.failNext = null;
       send(res, f.status, f.body, f.headers, reqId);
+      return;
+    }
+
+    if (state.jobGone && method === "GET" && path.includes("/execs/")) {
+      send(res, state.jobGone.status, state.jobGone.body, undefined, reqId);
       return;
     }
 
@@ -130,6 +143,10 @@ before(async () => {
         exit_code: script.includes("fail") ? 1 : 0,
         truncated: false,
       };
+      if (state.jobGone) {
+        rec.state = "running";
+        rec.exit_code = null;
+      }
       state.jobs.set(eid, { rec, stdout: Buffer.from(`out:${script}`) });
       send(res, 202, rec);
       return;
@@ -261,6 +278,7 @@ beforeEach(() => {
   state.paginate = false;
   state.dropCount = 0;
   state.jobs.clear();
+  state.jobGone = null;
   delete process.env.SISTEMO_API_KEY;
   delete process.env.SISTEMO_BASE_URL;
 });
@@ -372,6 +390,35 @@ describe("Client", () => {
     const out = await c.listVolumes();
     assert.equal(out.volumes[0].id, "v1");
     assert.equal(state.log.filter((l) => l.path === "/v1/volumes").length, 2);
+  });
+
+  it("a dropped create (with Idempotency-Key) is retried", async () => {
+    state.dropCount = 1;
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl, timeoutMs: 500, retryBackoffMs: 5 });
+    const creates = state.log.filter((l) => l.method === "POST" && l.path === "/v1/machines");
+    assert.equal(creates.length, 2);
+    assert.equal(creates[0].idem, creates[1].idem);
+    assert.equal(sb.id, "m-1");
+  });
+
+  it("POST without Idempotency-Key is not retried on drop", async () => {
+    const c = new Client({
+      apiKey: "k",
+      baseUrl,
+      maxRetries: 2,
+      retryBackoffMs: 5,
+      timeoutMs: 500,
+    });
+    state.dropCount = 2;
+    await assert.rejects(
+      () => c.request("POST", "/v1/machines/nope/execs", { exec_id: "e", script: "x" }),
+      (e) => {
+        assert.ok(e instanceof SistemoError);
+        assert.match(e.message, /connection error/);
+        return true;
+      },
+    );
+    assert.equal(state.log.filter((l) => l.method === "POST").length, 1);
   });
 });
 
@@ -550,6 +597,93 @@ describe("Sandbox", () => {
       (e) => e instanceof NotFoundError,
     );
   });
+
+  it("POST /execs connection drop is not retried", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl, timeoutMs: 500 });
+    state.log = [];
+    state.dropCount = 2;
+    await assert.rejects(() => sb.run("echo once"), (e) => {
+      assert.ok(e instanceof SistemoError);
+      assert.match(e.message, /connection error/);
+      return true;
+    });
+    const execs = state.log.filter((l) => l.method === "POST" && l.path.endsWith("/execs"));
+    assert.equal(execs.length, 1);
+  });
+
+  it("run() lost when the machine stops mid-wait", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.jobGone = {
+      status: 409,
+      body: { code: "machine_not_running", detail: "stopped" },
+    };
+    const r = await sb.run("echo hi");
+    assert.equal(r.lost, true);
+    assert.equal(r.exitCode, -1);
+    assert.equal(r.ok, false);
+    assert.equal(r.stdout, "");
+  });
+
+  it("start() on a stopped machine raises MachineNotRunningError", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.failNext = {
+      status: 409,
+      body: { code: "machine_not_running", detail: "stopped" },
+    };
+    await assert.rejects(() => sb.start("echo hi"), (err) => {
+      assert.ok(err instanceof MachineNotRunningError);
+      assert.ok(err instanceof APIError);
+      assert.equal(err.code, "machine_not_running");
+      return true;
+    });
+    assert.equal(
+      state.log.filter((l) => l.method === "GET" && l.path.includes("/execs/")).length,
+      0,
+      "start() must not GET-recover a refusal — nothing started",
+    );
+  });
+
+  it("the 17th parallel run() is TooManyExecsError", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.failNext = {
+      status: 409,
+      body: { code: "too_many_execs", detail: "wait", retryable: true },
+    };
+    await assert.rejects(() => sb.run("echo hi"), (err) => {
+      assert.ok(err instanceof TooManyExecsError);
+      assert.ok(err instanceof APIError);
+      assert.ok(!(err instanceof MachineNotRunningError));
+      assert.equal(err.code, "too_many_execs");
+      return true;
+    });
+    assert.equal(
+      state.log.filter((l) => l.method === "GET" && l.path.includes("/execs/")).length,
+      0,
+      "a fresh exec_id after too_many_execs must not be GET-recovered",
+    );
+  });
+
+  it("run() lost when the job 404s mid-wait", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.jobGone = { status: 404, body: { code: "not_found", detail: "gone" } };
+    const r = await sb.run("echo hi");
+    assert.equal(r.lost, true);
+    assert.equal(r.exitCode, -1);
+  });
+
+  it("run() lost when the job 410s mid-wait", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.jobGone = { status: 410, body: { code: "gone", detail: "aged out" } };
+    const r = await sb.run("echo hi");
+    assert.equal(r.lost, true);
+    assert.equal(r.exitCode, -1);
+  });
+
+  it("run() does not mark lost on a too_many_execs poll", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.jobGone = { status: 409, body: { code: "too_many_execs", detail: "wait" } };
+    await assert.rejects(() => sb.run("echo hi"), (err) => err instanceof TooManyExecsError);
+  });
 });
 
 describe("request id and Retry-After", () => {
@@ -625,6 +759,7 @@ describe("request id and Retry-After", () => {
       },
     };
     await assert.rejects(() => c.request("GET", "/v1/volumes"), (err) => {
+      assert.ok(err instanceof TooManyExecsError);
       assert.equal(err.retryable, true);
       assert.equal(err.docUrl, "https://docs.sistemo.io/errors/too_many_execs");
       return true;
@@ -808,8 +943,29 @@ describe("409 is not a balance error", () => {
     await assert.rejects(() => c.listVolumes(), (err) => {
       assert.ok(err instanceof APIError);
       assert.ok(!(err instanceof InsufficientBalanceError));
+      assert.ok(!(err instanceof TooManyExecsError));
       return true;
     });
+  });
+
+  it("maps each start-refused 409 to its class", async () => {
+    const cases = [
+      ["too_many_execs", TooManyExecsError],
+      ["machine_process_limit", ProcessLimitError],
+      ["machine_disk_full", DiskFullError],
+      ["machine_out_of_memory", OutOfMemoryError],
+      ["machine_not_running", MachineNotRunningError],
+    ];
+    for (const [code, cls] of cases) {
+      state.failNext = { status: 409, body: { code, detail: "x" } };
+      const c = new Client({ apiKey: "k", baseUrl, maxRetries: 0 });
+      await assert.rejects(() => c.request("GET", "/v1/volumes"), (err) => {
+        assert.ok(err instanceof cls, `${code} should be ${cls.name}`);
+        assert.ok(err instanceof APIError);
+        assert.ok(!(err instanceof InsufficientBalanceError));
+        return true;
+      });
+    }
   });
 });
 

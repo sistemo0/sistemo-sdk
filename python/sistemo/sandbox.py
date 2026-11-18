@@ -143,9 +143,10 @@ class Sandbox:
         and the API never holds the connection for the whole command.
 
         ``env`` and ``cwd`` are sent only when set, so option-less starts still
-        work on older guest agents. HTTP 5xx/429 on start are **not** retried
-        (replaying would re-run the script). If start is unconfirmed, this still
-        waits on the id we minted.
+        work on older guest agents. HTTP 5xx/429 and dropped connections on
+        start are **not** retried (replaying would re-run the script). If start
+        is unconfirmed, this still waits on the id we minted. If the machine
+        stops while waiting, this returns ``lost=True`` rather than raising 409.
         """
         from .errors import ExecStartUnconfirmed
 
@@ -185,7 +186,8 @@ class Sandbox:
         ⚠ You mint ``exec_id`` (a UUID is generated if you omit it). If the
         start response is lost, poll that id rather than starting again.
         Re-sending the same id is a 409 ``exec_id_in_use``, not a second run.
-        ``too_many_execs`` is a different 409: wait for a command to finish.
+        ``too_many_execs`` is :class:`~sistemo.errors.TooManyExecsError`: wait
+        for a command to finish.
 
         ⚠ If this raises :class:`~sistemo.errors.ExecStartUnconfirmed`, the
         command **may be running**. The exception carries ``exec_id``; poll it
@@ -204,6 +206,7 @@ class Sandbox:
                 "POST",
                 f"/v1/machines/{self.id}/execs",
                 body,
+                max_retries=0,
             )
         except APIError as e:
             if e.status == 409:

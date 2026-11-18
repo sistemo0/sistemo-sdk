@@ -11,7 +11,16 @@ import codecs
 import time
 from typing import TYPE_CHECKING, Iterator
 
-from .errors import SistemoError
+from .errors import APIError, GoneError, MachineNotRunningError, NotFoundError, SistemoError
+
+
+def _unaccountable(err: BaseException) -> bool:
+    """The machine (or its job record) is gone — we cannot say what ran.
+
+    ``start()`` still raises these. ``wait()`` / ``run()`` on a handle that
+    already exists map them to ``lost``.
+    """
+    return isinstance(err, (MachineNotRunningError, NotFoundError, GoneError))
 
 if TYPE_CHECKING:  # pragma: no cover
     from .sandbox import Sandbox
@@ -88,13 +97,23 @@ class Job:
 
     # ── polling ─────────────────────────────────────────────────────
 
+    def _mark_lost(self) -> "Job":
+        self.state = "lost"
+        self.exit_code = None
+        return self
+
     def refresh(self) -> "Job":
         """Re-read the job's state from the API."""
-        return self._apply(
-            self._sb._client.request(
-                "GET", f"/v1/machines/{self._sb.id}/execs/{self.id}"
+        try:
+            return self._apply(
+                self._sb._client.request(
+                    "GET", f"/v1/machines/{self._sb.id}/execs/{self.id}"
+                )
             )
-        )
+        except APIError as e:
+            if _unaccountable(e):
+                return self._mark_lost()
+            raise
 
     def wait(self, timeout: float | None = None, poll_interval: float = 1.0) -> "Job":
         """Block until the job reaches a terminal state, then return it.
@@ -137,11 +156,16 @@ class Job:
         Cancelling a job that already finished is a no-op, so a retried cancel
         is safe.
         """
-        return self._apply(
-            self._sb._client.request(
-                "DELETE", f"/v1/machines/{self._sb.id}/execs/{self.id}"
+        try:
+            return self._apply(
+                self._sb._client.request(
+                    "DELETE", f"/v1/machines/{self._sb.id}/execs/{self.id}"
+                )
             )
-        )
+        except APIError as e:
+            if _unaccountable(e):
+                return self._mark_lost()
+            raise
 
     # ── output ──────────────────────────────────────────────────────
 
@@ -160,11 +184,17 @@ class Job:
         offset = 0
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            page = self._sb._client.request(
-                "GET",
-                f"/v1/machines/{self._sb.id}/execs/{self.id}/output"
-                f"?stream={stream}&offset={offset}&limit={limit}",
-            )
+            try:
+                page = self._sb._client.request(
+                    "GET",
+                    f"/v1/machines/{self._sb.id}/execs/{self.id}/output"
+                    f"?stream={stream}&offset={offset}&limit={limit}",
+                )
+            except APIError as e:
+                if _unaccountable(e):
+                    self._mark_lost()
+                    return
+                raise
             offset = int(page.get("next_offset") or offset)
             raw = page.get("data") or ""
             data = base64.b64decode(raw) if raw else b""
@@ -213,11 +243,17 @@ class Job:
         buf = bytearray()
         offset = 0
         while True:
-            page = self._sb._client.request(
-                "GET",
-                f"/v1/machines/{self._sb.id}/execs/{self.id}/output"
-                f"?stream={stream}&offset={offset}&limit=65536",
-            )
+            try:
+                page = self._sb._client.request(
+                    "GET",
+                    f"/v1/machines/{self._sb.id}/execs/{self.id}/output"
+                    f"?stream={stream}&offset={offset}&limit=65536",
+                )
+            except APIError as e:
+                if _unaccountable(e):
+                    self._mark_lost()
+                    return bytes(buf)
+                raise
             raw = page.get("data") or ""
             data = base64.b64decode(raw) if raw else b""
             buf.extend(data)

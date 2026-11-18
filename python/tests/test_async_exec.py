@@ -236,20 +236,33 @@ class AsyncExecTest(unittest.TestCase):
         self.assertEqual(job.state, "running")
         self.assertEqual(len(SCENE.get("starts", [])), 1)
 
-    def test_start_too_many_execs_does_not_get(self):
-        from sistemo.errors import APIError
+    def test_start_refused_409s_do_not_get(self):
+        from sistemo.errors import (
+            DiskFullError,
+            MachineNotRunningError,
+            OutOfMemoryError,
+            ProcessLimitError,
+            TooManyExecsError,
+        )
 
-        SCENE["start_status"] = 409
-        SCENE["start_body"] = {
-            "code": "too_many_execs",
-            "detail": "the machine is already running its maximum number of concurrent commands",
-        }
-        SCENE["job"] = job_rec("running")
-        sb = self.sandbox()
-        with self.assertRaises(APIError) as cm:
-            sb.start("echo hi")
-        self.assertEqual(cm.exception.code, "too_many_execs")
-        self.assertFalse(SCENE.get("gets"))
+        cases = (
+            ("too_many_execs", TooManyExecsError),
+            ("machine_process_limit", ProcessLimitError),
+            ("machine_disk_full", DiskFullError),
+            ("machine_out_of_memory", OutOfMemoryError),
+            ("machine_not_running", MachineNotRunningError),
+        )
+        for code, cls in cases:
+            with self.subTest(code=code):
+                SCENE.clear()
+                SCENE["job"] = job_rec("running")
+                SCENE["start_status"] = 409
+                SCENE["start_body"] = {"code": code, "detail": "x"}
+                sb = self.sandbox()
+                with self.assertRaises(cls) as cm:
+                    sb.start("echo hi")
+                self.assertEqual(cm.exception.code, code)
+                self.assertFalse(SCENE.get("gets"))
 
     def test_start_sends_env(self):
         SCENE["job"] = job_rec("running")

@@ -17,8 +17,13 @@ import unittest
 from sistemo.errors import (
     APIError,
     AuthError,
+    DiskFullError,
     InsufficientBalanceError,
+    MachineNotRunningError,
+    OutOfMemoryError,
+    ProcessLimitError,
     QuotaExceededError,
+    TooManyExecsError,
     api_error,
 )
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -30,10 +35,12 @@ from sistemo import (
     AuthError,
     Client,
     ExecResult,
+    MachineNotRunningError,
     NotFoundError,
     RateLimitError,
     Sandbox,
     SistemoError,
+    TooManyExecsError,
 )
 import sistemo
 from sistemo._client import USER_AGENT
@@ -57,6 +64,8 @@ class _MockAPI(BaseHTTPRequestHandler):
     # Close without a byte of HTTP this many times (RemoteDisconnected).
     drop_count: int = 0
     jobs: dict[str, dict] = {}
+    # Sticky GET failure for /execs/{id} and /output (machine stopped mid-wait).
+    job_gone: dict[str, Any] | None = None
 
     def log_message(self, format: str, *args) -> None:  # quiet
         return
@@ -141,6 +150,15 @@ class _MockAPI(BaseHTTPRequestHandler):
             )
             return
 
+        if (
+            _MockAPI.job_gone is not None
+            and method == "GET"
+            and "/execs/" in path
+        ):
+            fail = _MockAPI.job_gone
+            self._send(fail["status"], fail.get("body", {"detail": "gone"}))
+            return
+
         if not auth.startswith("Bearer "):
             self._send(401, {"detail": "missing key", "code": "unauthorized"})
             return
@@ -172,6 +190,9 @@ class _MockAPI(BaseHTTPRequestHandler):
                 "exit_code": 0 if "fail" not in script else 1,
                 "truncated": False,
             }
+            if _MockAPI.job_gone is not None:
+                rec["state"] = "running"
+                rec["exit_code"] = None
             _MockAPI.jobs[eid] = {"rec": rec, "stdout": f"out:{script}".encode()}
             self._send(202, rec)
             return
@@ -347,6 +368,7 @@ class SDKTest(unittest.TestCase):
         _MockAPI.paginate = False
         _MockAPI.drop_count = 0
         _MockAPI.jobs.clear()
+        _MockAPI.job_gone = None
         # isolate env
         self._env = os.environ.copy()
         os.environ.pop("SISTEMO_API_KEY", None)
@@ -636,8 +658,9 @@ class SDKTest(unittest.TestCase):
                 "doc_url": "https://docs.sistemo.io/errors/too_many_execs",
             },
         }
-        with self.assertRaises(APIError) as cm:
+        with self.assertRaises(TooManyExecsError) as cm:
             c.request("GET", "/v1/volumes")
+        self.assertIsInstance(cm.exception, APIError)
         self.assertIs(cm.exception.retryable, True)
         self.assertEqual(
             cm.exception.doc_url, "https://docs.sistemo.io/errors/too_many_execs"
@@ -706,6 +729,140 @@ class SDKTest(unittest.TestCase):
         sb = Sandbox(api_key="k", base_url=self.base)
         _MockAPI.paginate = True
         self.assertEqual([j.id for j in sb.iter_jobs(limit=1)], ["e1", "e2"])
+
+    def test_exec_connection_drop_is_not_retried(self) -> None:
+        """POST /execs must not replay a dropped connection (no idempotency)."""
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.log.clear()
+        _MockAPI.drop_count = 2
+        with self.assertRaises(SistemoError) as cm:
+            sb.run("echo once")
+        self.assertIn("connection error", str(cm.exception))
+        execs = [
+            x
+            for x in _MockAPI.log
+            if x["method"] == "POST" and x["path"].endswith("/execs")
+        ]
+        self.assertEqual(len(execs), 1)
+
+    def test_post_without_idempotency_is_not_retried_on_drop(self) -> None:
+        """Counter-guard for _retry_safe itself — start() also sets max_retries=0.
+
+        A Client.request POST with the default retry budget and no
+        Idempotency-Key must stop after one drop. If this only went through
+        start(), deleting _retry_safe would still pass.
+        """
+        c = Client(
+            api_key="k", base_url=self.base, max_retries=2, retry_backoff=0.01
+        )
+        _MockAPI.drop_count = 2
+        with self.assertRaises(SistemoError) as cm:
+            c.request(
+                "POST",
+                "/v1/machines/nope/execs",
+                {"exec_id": "e", "script": "x"},
+            )
+        self.assertIn("connection error", str(cm.exception))
+        posts = [x for x in _MockAPI.log if x["method"] == "POST"]
+        self.assertEqual(len(posts), 1)
+
+    def test_create_connection_drop_is_retried(self) -> None:
+        """Counter-guard: POST /v1/machines carries Idempotency-Key, so it retries."""
+        _MockAPI.drop_count = 1
+        sb = Sandbox(api_key="k", base_url=self.base)
+        creates = [
+            x
+            for x in _MockAPI.log
+            if x["method"] == "POST" and x["path"] == "/v1/machines"
+        ]
+        self.assertEqual(len(creates), 2)
+        self.assertEqual(creates[0]["idem"], creates[1]["idem"])
+        self.assertEqual(sb.id, "m-1")
+
+    def test_run_lost_when_machine_stops(self) -> None:
+        """A 409 machine_not_running mid-wait is lost, not a raised error."""
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.job_gone = {
+            "status": 409,
+            "body": {"code": "machine_not_running", "detail": "stopped"},
+        }
+        r = sb.run("echo hi")
+        self.assertTrue(r.lost)
+        self.assertEqual(r.exit_code, -1)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.stdout, "")
+
+    def test_run_lost_when_job_404s(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.job_gone = {
+            "status": 404,
+            "body": {"code": "not_found", "detail": "gone"},
+        }
+        r = sb.run("echo hi")
+        self.assertTrue(r.lost)
+        self.assertEqual(r.exit_code, -1)
+
+    def test_run_lost_when_job_410s(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.job_gone = {
+            "status": 410,
+            "body": {"code": "gone", "detail": "aged out"},
+        }
+        r = sb.run("echo hi")
+        self.assertTrue(r.lost)
+        self.assertEqual(r.exit_code, -1)
+
+    def test_run_does_not_mark_lost_on_too_many_execs_poll(self) -> None:
+        """Counter-guard: only unaccountable codes become lost, not every 409."""
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.job_gone = {
+            "status": 409,
+            "body": {"code": "too_many_execs", "detail": "wait"},
+        }
+        with self.assertRaises(TooManyExecsError):
+            sb.run("echo hi")
+
+    def test_start_on_stopped_machine_raises(self) -> None:
+        """start() of a new command on a stopped machine is not lost — nothing started."""
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.fail_next = {
+            "status": 409,
+            "body": {"code": "machine_not_running", "detail": "stopped"},
+        }
+        with self.assertRaises(MachineNotRunningError) as cm:
+            sb.start("echo hi")
+        self.assertEqual(cm.exception.code, "machine_not_running")
+        self.assertIsInstance(cm.exception, APIError)
+        self.assertFalse(
+            any(
+                x["method"] == "GET" and "/execs/" in x["path"]
+                for x in _MockAPI.log
+            ),
+            "start() must not GET-recover a refusal — nothing started",
+        )
+
+    def test_run_17th_is_too_many_execs(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.fail_next = {
+            "status": 409,
+            "body": {
+                "code": "too_many_execs",
+                "detail": "wait",
+                "retryable": True,
+            },
+        }
+        with self.assertRaises(TooManyExecsError) as cm:
+            sb.run("echo hi")
+        self.assertEqual(cm.exception.code, "too_many_execs")
+        self.assertIsInstance(cm.exception, APIError)
+        self.assertNotIsInstance(cm.exception, MachineNotRunningError)
+        self.assertFalse(
+            any(
+                x["method"] == "GET" and "/execs/" in x["path"]
+                for x in _MockAPI.log
+            ),
+            "a fresh exec_id after too_many_execs must not be GET-recovered",
+        )
 
     def test_connect_does_not_create(self) -> None:
         sb = Sandbox(api_key="k", base_url=self.base)
@@ -882,7 +1039,24 @@ class QuotaErrorMappingTest(unittest.TestCase):
         # would catch a reused exec_id as "please top up".
         err = api_error(409, "exec_id already in use", "exec_id_in_use")
         self.assertNotIsInstance(err, InsufficientBalanceError)
+        self.assertNotIsInstance(err, TooManyExecsError)
         self.assertIsInstance(err, APIError)
+
+    def test_too_many_execs_is_its_own_type(self):
+        err = api_error(409, "wait", "too_many_execs")
+        self.assertIsInstance(err, TooManyExecsError)
+        self.assertIsInstance(err, APIError)
+        self.assertNotIsInstance(err, MachineNotRunningError)
+
+    def test_machine_not_running_is_its_own_type(self):
+        err = api_error(409, "stopped", "machine_not_running")
+        self.assertIsInstance(err, MachineNotRunningError)
+        self.assertNotIsInstance(err, TooManyExecsError)
+
+    def test_process_disk_oom_409s_are_typed(self):
+        self.assertIsInstance(api_error(409, "x", "machine_process_limit"), ProcessLimitError)
+        self.assertIsInstance(api_error(409, "x", "machine_disk_full"), DiskFullError)
+        self.assertIsInstance(api_error(409, "x", "machine_out_of_memory"), OutOfMemoryError)
 
 
 class VersionDriftTest(unittest.TestCase):
