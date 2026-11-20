@@ -44,6 +44,7 @@ from sistemo import (
     TooManyExecsError,
 )
 import sistemo
+import sistemo.sandbox as sandbox_mod
 from sistemo._client import USER_AGENT
 
 
@@ -66,6 +67,9 @@ class _MockAPI(BaseHTTPRequestHandler):
     drop_count: int = 0
     # When dropping a POST /execs, still store the job (response lost, guest accepted).
     drop_store_exec: bool = False
+    # First N GET /execs/{id} answer 404 even if the job is stored (POST still
+    # in flight). The SDK must retry those, not treat them as "nothing started".
+    exec_lookup_404s: int = 0
     jobs: dict[str, dict] = {}
     # Sticky GET failure for /execs/{id} and /output (machine stopped mid-wait).
     job_gone: dict[str, Any] | None = None
@@ -288,6 +292,10 @@ class _MockAPI(BaseHTTPRequestHandler):
 
         if method == "GET" and "/execs/" in path:
             eid = path.split("/")[5]
+            if _MockAPI.exec_lookup_404s > 0:
+                _MockAPI.exec_lookup_404s -= 1
+                self._send(404, {"detail": "not found", "code": "not_found"})
+                return
             job = _MockAPI.jobs.get(eid)
             if not job:
                 self._send(404, {"detail": "not found", "code": "not_found"})
@@ -394,9 +402,14 @@ class SDKTest(unittest.TestCase):
         _MockAPI.paginate = False
         _MockAPI.drop_count = 0
         _MockAPI.drop_store_exec = False
+        _MockAPI.exec_lookup_404s = 0
         _MockAPI.jobs.clear()
         _MockAPI.job_gone = None
         _MockAPI.output_gone = None
+        # Production waits a few seconds on GET 404 after a dropped POST. Zero
+        # here so a genuine miss (nothing started) stays a fast test.
+        sandbox_mod._START_LOOKUP_SECONDS = 0.0
+        sandbox_mod._START_LOOKUP_INTERVAL = 0.0
         # isolate env
         self._env = os.environ.copy()
         os.environ.pop("SISTEMO_API_KEY", None)
@@ -797,6 +810,68 @@ class SDKTest(unittest.TestCase):
             "a dropped start must GET the minted exec_id",
         )
 
+    def test_run_recovers_dropped_start_after_lookup_404s(self) -> None:
+        """The API 404s for a beat while still accepting the POST. GET again, never re-POST."""
+        sandbox_mod._START_LOOKUP_SECONDS = 2.0
+        sandbox_mod._START_LOOKUP_INTERVAL = 0.0
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.log.clear()
+        _MockAPI.drop_store_exec = True
+        _MockAPI.drop_count = 1
+        _MockAPI.exec_lookup_404s = 2
+        r = sb.run("echo recovered")
+        self.assertTrue(r.ok)
+        self.assertIn("echo recovered", r.stdout)
+        self.assertFalse(r.lost)
+        posts = [
+            x
+            for x in _MockAPI.log
+            if x["method"] == "POST" and x["path"].endswith("/execs")
+        ]
+        self.assertEqual(len(posts), 1)
+        job_gets = [
+            x
+            for x in _MockAPI.log
+            if x["method"] == "GET"
+            and "/execs/" in x["path"]
+            and not x["path"].endswith("/output")
+        ]
+        self.assertGreaterEqual(
+            len(job_gets),
+            3,
+            "two 404s then a hit — a single GET would have reported nothing started",
+        )
+
+    def test_dropped_start_lookup_404s_for_the_whole_window_is_original(self) -> None:
+        """After the window, a 404 still means nothing started — and we still do not re-POST."""
+        sandbox_mod._START_LOOKUP_SECONDS = 0.05
+        sandbox_mod._START_LOOKUP_INTERVAL = 0.0
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.log.clear()
+        _MockAPI.drop_count = 1
+        with self.assertRaises(SistemoError) as cm:
+            sb.run("echo once")
+        self.assertNotIsInstance(cm.exception, ExecStartUnconfirmed)
+        self.assertIn("connection error", str(cm.exception))
+        posts = [
+            x
+            for x in _MockAPI.log
+            if x["method"] == "POST" and x["path"].endswith("/execs")
+        ]
+        self.assertEqual(len(posts), 1)
+        job_gets = [
+            x
+            for x in _MockAPI.log
+            if x["method"] == "GET"
+            and "/execs/" in x["path"]
+            and not x["path"].endswith("/output")
+        ]
+        self.assertGreaterEqual(
+            len(job_gets),
+            2,
+            "the window must GET more than once before giving up",
+        )
+
     def test_dropped_start_raises_unconfirmed_when_get_also_fails(self) -> None:
         """If GET cannot tell either, the error still carries exec_id."""
         sb = Sandbox(
@@ -808,6 +883,10 @@ class SDKTest(unittest.TestCase):
         with self.assertRaises(ExecStartUnconfirmed) as cm:
             sb.start("echo hi")
         self.assertTrue(cm.exception.exec_id)
+        self.assertTrue(
+            cm.exception.request_id,
+            "the unconfirmed error must carry the POST request_id, not a blank 503",
+        )
         posts = [
             x
             for x in _MockAPI.log

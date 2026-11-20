@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Iterator
@@ -20,6 +21,16 @@ _SKIP_GET_409 = frozenset(
         "machine_not_running",
     }
 )
+
+# After a POST /execs whose ACK was lost, GET of the minted id retries 404 for
+# this long. The API can 404 for 0.2–0.5 s while still accepting the request;
+# a single GET treated that as "nothing started" while the command finished.
+#
+# Never re-POST — even with the same id — once the request body may have
+# left this process. The minted exec_id is the handle we already hold: GET it.
+# Tests set both to 0 so a genuine miss stays fast.
+_START_LOOKUP_SECONDS = 3.0
+_START_LOOKUP_INTERVAL = 0.2
 
 
 @dataclass
@@ -156,9 +167,10 @@ class Sandbox:
         ``env`` and ``cwd`` are sent only when set, so option-less starts still
         work on older guest agents. HTTP 5xx/429 and dropped connections on
         start are **not** retried (replaying would re-run the script). A dropped
-        start is recovered by GET of the minted id. If start is unconfirmed,
-        this still waits on that id. If the machine stops while waiting, this
-        returns ``lost=True`` rather than raising 409.
+        start is recovered by GET of the minted id (404 is retried for a few
+        seconds — the API can 404 while still accepting the POST). If start is
+        unconfirmed, this still waits on that id. If the machine stops while
+        waiting, this returns ``lost=True`` rather than raising 409.
         """
         eid = str(uuid.uuid4())
         try:
@@ -205,7 +217,8 @@ class Sandbox:
         ⚠ If this raises :class:`~sistemo.errors.ExecStartUnconfirmed`, the
         command **may be running**. The exception carries ``exec_id``; poll it
         with :meth:`job` rather than starting over. A dropped connection on
-        POST is recovered the same way: GET that id, never re-POST.
+        POST is recovered the same way: GET that id (404 retried briefly),
+        never re-POST.
         """
         eid = exec_id or str(uuid.uuid4())
         body: dict = {"exec_id": eid, "script": script, "timeout_sec": timeout}
@@ -238,24 +251,37 @@ class Sandbox:
     ) -> Job:
         """GET the minted id after a POST whose outcome we cannot trust.
 
-        Found → that job. 404 → the original error (nothing started). Any
-        other GET failure → :class:`ExecStartUnconfirmed` so the caller has
-        the handle.
+        Found → that job. 404 is retried for a few seconds (the API can 404
+        while still accepting the POST). After that, 404 → the original error
+        (nothing started). Any other GET failure → :class:`ExecStartUnconfirmed`
+        so the caller has the handle. Never re-POST — even with the same id —
+        because the body may already be in flight.
         """
-        try:
-            rec = self._client.request(
-                "GET", f"/v1/machines/{self.id}/execs/{eid}"
-            )
-        except NotFoundError:
-            raise original from None
-        except SistemoError:
-            raise ExecStartUnconfirmed(
-                503,
-                "connection dropped while starting; the command may be running",
-                None,
-                {"exec_id": eid},
-            ) from original
-        return Job(self, rec)
+        # Capture before GET overwrites last_request_id.
+        post_rid = getattr(original, "request_id", None) or getattr(
+            self._client, "last_request_id", None
+        )
+        deadline = time.monotonic() + _START_LOOKUP_SECONDS
+        while True:
+            try:
+                rec = self._client.request(
+                    "GET", f"/v1/machines/{self.id}/execs/{eid}"
+                )
+            except NotFoundError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise original from None
+                time.sleep(min(_START_LOOKUP_INTERVAL, remaining))
+                continue
+            except SistemoError:
+                raise ExecStartUnconfirmed(
+                    503,
+                    "connection dropped while starting; the command may be running",
+                    None,
+                    {"exec_id": eid},
+                    request_id=str(post_rid) if post_rid else None,
+                ) from original
+            return Job(self, rec)
 
     def job(self, exec_id: str) -> Job:
         """Re-attach to a job by id — after a crash, or after an unconfirmed start."""
