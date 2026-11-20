@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.1.7";
+const USER_AGENT = "@sistemo/sdk/0.1.8";
 
 /**
  * After a POST /execs whose ACK was lost, GET of the minted id retries 404
@@ -179,6 +179,17 @@ export class OutOfMemoryError extends APIError {}
  * say.
  */
 export class MachineNotRunningError extends APIError {}
+
+/**
+ * `Sandbox.wait()` reached its deadline before the machine was running.
+ *
+ * The machine is unchanged. This is the caller's deadline, not a failure
+ * reported by the API.
+ */
+export class MachineTimeout extends SistemoError {}
+
+/** States that will not become running by polling. */
+const WAIT_FAIL = new Set(["stopped", "stopping", "error", "destroyed", "destroying"]);
 
 /** The machine (or its job record) is gone — we cannot say what ran. */
 function jobUnaccountable(e: unknown): boolean {
@@ -568,6 +579,57 @@ export class Client {
   deleteVolume(volumeId: string): Promise<{ status: string }> {
     return this.request("DELETE", `/v1/volumes/${volumeId}`);
   }
+
+  /**
+   * Account limits and current usage (`GET /v1/quotas`).
+   *
+   * The body is returned as the API sent it (`tier`, `quotas`, `per_machine`).
+   * Unknown fields are kept.
+   */
+  getQuotas(): Promise<Quotas> {
+    return this.request("GET", "/v1/quotas");
+  }
+
+  /**
+   * The image catalog (`GET /v1/images`).
+   *
+   * Each item is one catalog image. Pass its `name` as `stack` when creating
+   * a sandbox. An empty catalog is `[]`, never null.
+   */
+  async listImages(): Promise<Image[]> {
+    const out = await this.request<{ images?: Image[] | null }>("GET", "/v1/images");
+    return out.images ?? [];
+  }
+
+  /** List the account's snapshots. Same paging contract as {@link listVolumes}. */
+  async listSnapshots(opts?: { cursor?: string; limit?: number }): Promise<{
+    snapshots: Snapshot[];
+    nextCursor: string | null;
+  }> {
+    const out = await this.request<{ snapshots?: Snapshot[] | null; next_cursor?: string | null }>(
+      "GET",
+      withQuery("/v1/snapshots", opts),
+    );
+    return { snapshots: out.snapshots ?? [], nextCursor: out.next_cursor ?? null };
+  }
+
+  /** Yield every snapshot, following `nextCursor` until the last page. */
+  async *iterSnapshots(opts?: { limit?: number }): AsyncGenerator<Snapshot> {
+    yield* this.iterPages(
+      (cursor) => this.listSnapshots({ cursor, limit: opts?.limit }),
+      (p) => p.snapshots,
+    );
+  }
+
+  /** Roll a volume back to this snapshot (`POST /v1/snapshots/{id}/restore`). */
+  restoreSnapshot(snapshotId: string): Promise<Snapshot> {
+    return this.request("POST", `/v1/snapshots/${snapshotId}/restore`);
+  }
+
+  /** Delete a snapshot (`DELETE /v1/snapshots/{id}`). */
+  deleteSnapshot(snapshotId: string): Promise<{ status: string }> {
+    return this.request("DELETE", `/v1/snapshots/${snapshotId}`);
+  }
 }
 
 export interface Volume {
@@ -587,6 +649,40 @@ export interface Machine {
   memory_mb?: number;
   rootfs_size_gb?: number;
   stack?: string;
+  root_volume_id?: string;
+}
+
+export interface QuotaDimension {
+  name: string;
+  used: number;
+  limit: number;
+  description?: string;
+}
+
+/** Body of `GET /v1/quotas`. Extra fields the API adds are kept at runtime. */
+export interface Quotas {
+  tier?: string;
+  quotas?: QuotaDimension[];
+  per_machine?: { vcpus?: number; memory_mb?: number };
+}
+
+/** One catalog image from `GET /v1/images`. `name` is the create `stack`. */
+export interface Image {
+  name: string;
+  template_id?: string;
+  revision?: string;
+  display_name?: string;
+  description?: string;
+  is_default?: boolean;
+  status?: string;
+}
+
+export interface Snapshot {
+  id: string;
+  name?: string;
+  state?: string;
+  machine_id?: string | null;
+  origin_volume_id?: string | null;
 }
 
 /** One page of `jobs()`. A real array plus `nextCursor`. */
@@ -630,12 +726,21 @@ export interface SandboxOptions extends ClientOptions {
 export class Sandbox {
   readonly id: string;
   state: string;
+  /**
+   * The root volume this sandbox was created from, or the one a later read
+   * reported. Empty when neither is known.
+   *
+   * ⚠ Create's response does not include `root_volume_id`. The value kept
+   * here is the option passed to {@link create}, until a response names one.
+   */
+  rootVolumeId: string;
   private readonly client: Client;
 
-  private constructor(client: Client, id: string, state: string) {
+  private constructor(client: Client, id: string, state: string, rootVolumeId = "") {
     this.client = client;
     this.id = id;
     this.state = state;
+    this.rootVolumeId = rootVolumeId;
   }
 
   /** Provision a new microVM (resolves once it has booted). */
@@ -651,7 +756,7 @@ export class Sandbox {
     };
     if (opts.rootVolumeId) body.root_volume_id = opts.rootVolumeId;
     const key = opts.idempotencyKey ?? newIdempotencyKey();
-    const machine = await client.request<{ id?: string; state?: string }>(
+    const machine = await client.request<{ id?: string; state?: string; root_volume_id?: string }>(
       "POST",
       "/v1/machines",
       body,
@@ -664,21 +769,25 @@ export class Sandbox {
         "invalid_create_response",
       );
     }
-    return new Sandbox(client, machine.id, machine.state ?? "");
+    // The option wins. The create response does not carry root_volume_id.
+    const rootVolumeId = opts.rootVolumeId || machine.root_volume_id || "";
+    return new Sandbox(client, machine.id, machine.state ?? "", rootVolumeId);
   }
 
   /**
    * Re-attach to an existing machine — after a crash, or from a stored id.
    *
-   * Does **not** provision a new microVM. The machine must still exist
-   * (a 404 is {@link NotFoundError}).
+   * One `GET /v1/machines/{id}`. Does **not** provision a new microVM and
+   * does **not** wait for `running`. A machine that is still starting is
+   * returned as-is; call {@link wait} before {@link run}. A missing machine
+   * is {@link NotFoundError}.
    */
   static async connect(id: string, opts: SandboxOptions = {}): Promise<Sandbox> {
     if (!id) {
       throw new SistemoError("machine id is required");
     }
     const client = opts.client ?? new Client(opts);
-    const machine = await client.request<{ id?: string; state?: string }>(
+    const machine = await client.request<{ id?: string; state?: string; root_volume_id?: string }>(
       "GET",
       `/v1/machines/${id}`,
     );
@@ -689,7 +798,12 @@ export class Sandbox {
         "invalid_machine_response",
       );
     }
-    return new Sandbox(client, machine.id, machine.state ?? "");
+    return new Sandbox(
+      client,
+      machine.id,
+      machine.state ?? "",
+      machine.root_volume_id ? String(machine.root_volume_id) : "",
+    );
   }
 
   /**
@@ -877,6 +991,125 @@ export class Sandbox {
   async close(preserveStorage = false): Promise<void> {
     const q = preserveStorage ? "?preserve_storage=true" : "";
     await this.client.request("DELETE", `/v1/machines/${this.id}${q}`);
+  }
+
+  /**
+   * `await using` calls {@link close}. A failure there is swallowed, matching
+   * Python `__exit__`, so it cannot mask the error from the block.
+   */
+  async [Symbol.asyncDispose](): Promise<void> {
+    try {
+      await this.close();
+    } catch {
+      // best-effort cleanup
+    }
+  }
+
+  private applyMachine(rec: { state?: string; root_volume_id?: string }): void {
+    // ⚠ Omitting root_volume_id must not clear the one we already hold.
+    if (rec?.state) this.state = String(rec.state);
+    if (rec?.root_volume_id) this.rootVolumeId = String(rec.root_volume_id);
+  }
+
+  /** Re-read this machine (`GET /v1/machines/{id}`). */
+  async refresh(): Promise<this> {
+    this.applyMachine(
+      await this.client.request<{ state?: string; root_volume_id?: string }>(
+        "GET",
+        `/v1/machines/${this.id}`,
+      ),
+    );
+    return this;
+  }
+
+  /**
+   * Power this machine off (`POST /v1/machines/{id}/stop`).
+   *
+   * Attaching or detaching a volume requires the machine to be stopped.
+   */
+  async stop(): Promise<this> {
+    this.applyMachine(
+      await this.client.request<{ state?: string }>("POST", `/v1/machines/${this.id}/stop`),
+    );
+    return this;
+  }
+
+  /**
+   * Power this machine on (`POST /v1/machines/{id}/start`).
+   *
+   * ⚠ This is not {@link start}. `start(script)` starts a command inside the
+   * guest. `boot()` starts the machine itself, after {@link stop}.
+   */
+  async boot(): Promise<this> {
+    this.applyMachine(
+      await this.client.request<{ state?: string }>("POST", `/v1/machines/${this.id}/start`),
+    );
+    return this;
+  }
+
+  /**
+   * Poll `GET /v1/machines/{id}` until `state` is `running`.
+   *
+   * `timeoutMs` is required. {@link connect} does not wait, so a machine that
+   * is still `pending`, `provisioning`, or `starting` makes the next
+   * {@link run} throw {@link MachineNotRunningError} unless you wait here
+   * first. Create already returns a running machine; this does not change that.
+   *
+   * A machine that is `stopped`, `stopping`, `error`, `destroyed`, or
+   * `destroying` fails immediately. Waiting will not start it. Call
+   * {@link boot} to power a stopped machine on.
+   *
+   * Rejects with {@link MachineTimeout} when the deadline passes first.
+   */
+  async wait(timeoutMs: number, opts: { pollIntervalMs?: number } = {}): Promise<this> {
+    if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs)) {
+      throw new SistemoError("wait() requires a deadline in milliseconds");
+    }
+    const poll = opts.pollIntervalMs ?? 1000;
+    const deadline = monotonicMs() + Math.max(0, timeoutMs);
+    for (;;) {
+      // Refresh before sleeping. A machine that is already running must not
+      // pay a poll interval, and a stopped one must not sit until the deadline.
+      await this.refresh();
+      if (this.state === "running") return this;
+      if (WAIT_FAIL.has(this.state)) {
+        throw new SistemoError(
+          `machine ${this.id} is ${this.state} — waiting will not start it`,
+        );
+      }
+      const remaining = deadline - monotonicMs();
+      if (remaining <= 0) {
+        throw new MachineTimeout(`machine ${this.id} is still ${this.state} after ${timeoutMs}ms`);
+      }
+      await sleep(Math.min(poll, remaining));
+    }
+  }
+
+  /** Snapshot this machine's root volume (`POST /v1/machines/{id}/snapshots`). */
+  createSnapshot(name: string): Promise<Snapshot> {
+    return this.client.request("POST", `/v1/machines/${this.id}/snapshots`, { name });
+  }
+
+  /** List this machine's snapshots. Same paging contract as {@link Client.listSnapshots}. */
+  async listSnapshots(opts?: { cursor?: string; limit?: number }): Promise<{
+    snapshots: Snapshot[];
+    nextCursor: string | null;
+  }> {
+    const out = await this.client.request<{ snapshots?: Snapshot[] | null; next_cursor?: string | null }>(
+      "GET",
+      withQuery(`/v1/machines/${this.id}/snapshots`, opts),
+    );
+    return { snapshots: out.snapshots ?? [], nextCursor: out.next_cursor ?? null };
+  }
+
+  /** Roll back to a snapshot (`POST /v1/snapshots/{id}/restore`). */
+  restoreSnapshot(snapshotId: string): Promise<Snapshot> {
+    return this.client.restoreSnapshot(snapshotId);
+  }
+
+  /** Delete a snapshot (`DELETE /v1/snapshots/{id}`). */
+  deleteSnapshot(snapshotId: string): Promise<{ status: string }> {
+    return this.client.deleteSnapshot(snapshotId);
   }
 }
 

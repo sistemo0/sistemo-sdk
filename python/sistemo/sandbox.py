@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from typing import Iterator
 
 from ._client import Client, Page, _qs
-from .errors import APIError, ExecStartUnconfirmed, NotFoundError, SistemoError
+from .errors import (
+    APIError,
+    ExecStartUnconfirmed,
+    MachineTimeout,
+    NotFoundError,
+    SistemoError,
+)
 from .jobs import Job
 
 # 409s that mean the POST did not start this id. GET would 404 a fresh UUID.
@@ -31,6 +37,12 @@ _SKIP_GET_409 = frozenset(
 # Tests set both to 0 so a genuine miss stays fast.
 _START_LOOKUP_SECONDS = 3.0
 _START_LOOKUP_INTERVAL = 0.2
+
+# States that will not become running by polling. stop/error fail immediately;
+# the others are the same fact (the machine is going away, or already gone).
+_WAIT_FAIL = frozenset(
+    {"stopped", "stopping", "error", "destroyed", "destroying"}
+)
 
 
 @dataclass
@@ -128,8 +140,10 @@ class Sandbox:
     ) -> "Sandbox":
         """Re-attach to an existing machine — after a crash, or from a stored id.
 
-        Does **not** provision a new microVM. The machine must still exist
-        (a 404 is :class:`~sistemo.errors.NotFoundError`).
+        One ``GET /v1/machines/{id}``. Does **not** provision a new microVM
+        and does **not** wait for ``running``. A machine that is still
+        starting is returned as-is; call :meth:`wait` before :meth:`run`.
+        A missing machine is :class:`~sistemo.errors.NotFoundError`.
         """
         if not machine_id:
             raise SistemoError("machine id is required")
@@ -316,6 +330,109 @@ class Sandbox:
             if not nxt or nxt == cursor:
                 return
             cursor = nxt
+
+    def _apply_machine(self, rec: dict) -> None:
+        """Copy state (and a root volume id, when the API sent one) onto this instance.
+
+        ⚠ A response that omits ``root_volume_id`` must not clear the one we
+        already hold. Create's response does not include it — the machine
+        payload has no such field — so the value from the create option is
+        the only copy until a later response names one.
+        """
+        if not isinstance(rec, dict):
+            return
+        if rec.get("state"):
+            self.state = str(rec["state"])
+        if rec.get("root_volume_id"):
+            self.root_volume_id = str(rec["root_volume_id"])
+
+    def refresh(self) -> "Sandbox":
+        """Re-read this machine (``GET /v1/machines/{id}``)."""
+        self._apply_machine(self._client.request("GET", f"/v1/machines/{self.id}"))
+        return self
+
+    def stop(self) -> "Sandbox":
+        """Power this machine off (``POST /v1/machines/{id}/stop``).
+
+        Attaching or detaching a volume requires the machine to be stopped.
+        """
+        self._apply_machine(
+            self._client.request("POST", f"/v1/machines/{self.id}/stop")
+        )
+        return self
+
+    def boot(self) -> "Sandbox":
+        """Power this machine on (``POST /v1/machines/{id}/start``).
+
+        ⚠ This is not :meth:`start`. ``start(script)`` starts a command inside
+        the guest. ``boot()`` starts the machine itself, after :meth:`stop`.
+        """
+        self._apply_machine(
+            self._client.request("POST", f"/v1/machines/{self.id}/start")
+        )
+        return self
+
+    def wait(self, timeout: float, *, poll_interval: float = 1.0) -> "Sandbox":
+        """Poll ``GET /v1/machines/{id}`` until ``state`` is ``running``.
+
+        ``timeout`` is required (seconds). :meth:`connect` does not wait, so a
+        machine that is still ``pending``, ``provisioning``, or ``starting``
+        makes the next :meth:`run` raise
+        :class:`~sistemo.errors.MachineNotRunningError` unless you wait here
+        first. Create already returns a running machine; this does not change
+        that.
+
+        A machine that is ``stopped``, ``stopping``, ``error``, ``destroyed``,
+        or ``destroying`` fails immediately. Waiting will not start it. Call
+        :meth:`boot` to power a stopped machine on.
+
+        Raises :class:`~sistemo.errors.MachineTimeout` when the deadline
+        passes first. The machine is left as the last poll saw it.
+        """
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise SistemoError("wait() requires a deadline in seconds")
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            # Refresh before sleeping. A machine that is already running must
+            # not pay a poll interval, and a stopped one must not sit until
+            # the deadline.
+            self.refresh()
+            if self.state == "running":
+                return self
+            if self.state in _WAIT_FAIL:
+                raise SistemoError(
+                    f"machine {self.id} is {self.state} — waiting will not start it"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MachineTimeout(
+                    f"machine {self.id} is still {self.state} after {timeout}s"
+                )
+            time.sleep(min(poll_interval, remaining))
+
+    def create_snapshot(self, name: str) -> dict:
+        """Snapshot this machine's root volume (``POST /v1/machines/{id}/snapshots``)."""
+        return self._client.request(
+            "POST", f"/v1/machines/{self.id}/snapshots", {"name": name}
+        )
+
+    def list_snapshots(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> Page:
+        """List this machine's snapshots. Same paging contract as :meth:`Client.list_snapshots`."""
+        out = self._client.request(
+            "GET",
+            _qs(f"/v1/machines/{self.id}/snapshots", cursor=cursor, limit=limit),
+        )
+        return Page(out.get("snapshots") or [], out.get("next_cursor"))
+
+    def restore_snapshot(self, snapshot_id: str) -> dict:
+        """Roll back to a snapshot (``POST /v1/snapshots/{id}/restore``)."""
+        return self._client.restore_snapshot(snapshot_id)
+
+    def delete_snapshot(self, snapshot_id: str) -> dict:
+        """Delete a snapshot (``DELETE /v1/snapshots/{id}``)."""
+        return self._client.delete_snapshot(snapshot_id)
 
     def close(self, preserve_storage: bool = False) -> None:
         """Destroy the sandbox (and its disk unless ``preserve_storage``)."""

@@ -37,7 +37,9 @@ from sistemo import (
     ExecResult,
     ExecStartUnconfirmed,
     MachineNotRunningError,
+    MachineTimeout,
     NotFoundError,
+    Page,
     RateLimitError,
     Sandbox,
     SistemoError,
@@ -75,6 +77,10 @@ class _MockAPI(BaseHTTPRequestHandler):
     job_gone: dict[str, Any] | None = None
     # Sticky GET failure for /output only (command already succeeded).
     output_gone: dict[str, Any] | None = None
+    snapshots: list[dict] = []
+    # GET of a not-yet-running machine flips it to running after this many reads.
+    promote_after: int = 0
+    machine_gets: int = 0
 
     @staticmethod
     def _accept_exec(path: str, body: Any) -> dict:
@@ -212,6 +218,8 @@ class _MockAPI(BaseHTTPRequestHandler):
                 return
             mid = "m-" + str(len(_MockAPI.machines) + 1)
             m = {"id": mid, "state": "running", **(body or {})}
+            # Production create does not echo root_volume_id.
+            m.pop("root_volume_id", None)
             _MockAPI.machines[mid] = m
             if idem:
                 _MockAPI.idem_create[idem] = mid
@@ -359,12 +367,117 @@ class _MockAPI(BaseHTTPRequestHandler):
             self._send(200, {"machines": items, "next_cursor": None})
             return
 
+        parts = path.strip("/").split("/")
+
+        if method == "GET" and path == "/v1/quotas":
+            self._send(
+                200,
+                {
+                    "tier": "free",
+                    "quotas": [
+                        {
+                            "name": "machines",
+                            "used": 1,
+                            "limit": 3,
+                            "description": "Machines that exist.",
+                        }
+                    ],
+                    "per_machine": {"vcpus": 2, "memory_mb": 2048},
+                    "future_field": "kept",
+                },
+            )
+            return
+
+        if method == "GET" and path == "/v1/images":
+            self._send(
+                200,
+                {
+                    "images": [
+                        {
+                            "name": "base",
+                            "template_id": "base_2026",
+                            "is_default": True,
+                            "status": "ready",
+                            "revision": "2026",
+                            "future": 1,
+                        }
+                    ]
+                },
+            )
+            return
+
+        if method == "GET" and path == "/v1/snapshots":
+            cursor = (parse_qs(urlparse(full_path).query).get("cursor") or [None])[0]
+            if _MockAPI.paginate:
+                if cursor == "p2":
+                    self._send(
+                        200,
+                        {"snapshots": [{"id": "s2", "name": "later", "state": "ready"}], "next_cursor": None},
+                    )
+                else:
+                    self._send(
+                        200,
+                        {
+                            "snapshots": [{"id": "s1", "name": "before", "state": "ready"}],
+                            "next_cursor": "p2",
+                        },
+                    )
+                return
+            self._send(200, {"snapshots": list(_MockAPI.snapshots), "next_cursor": None})
+            return
+
+        if method == "POST" and len(parts) == 4 and parts[0] == "v1" and parts[1] == "snapshots" and parts[3] == "restore":
+            self._send(200, {"id": parts[2], "state": "ready", "restored": True})
+            return
+
+        if method == "DELETE" and len(parts) == 3 and parts[0] == "v1" and parts[1] == "snapshots":
+            self._send(200, {"status": "deleted"})
+            return
+
+        if method == "POST" and len(parts) == 4 and parts[0] == "v1" and parts[1] == "machines" and parts[3] in ("stop", "start"):
+            m = _MockAPI.machines.get(parts[2])
+            if not m:
+                self._send(404, {"detail": "not found", "code": "not_found"})
+                return
+            m["state"] = "stopped" if parts[3] == "stop" else "running"
+            self._send(200, m)
+            return
+
+        if method == "POST" and len(parts) == 4 and parts[0] == "v1" and parts[1] == "machines" and parts[3] == "snapshots":
+            snap = {
+                "id": "snap-" + str(len(_MockAPI.snapshots) + 1),
+                "name": (body or {}).get("name"),
+                "state": "ready",
+                "machine_id": parts[2],
+                "extra": "kept",
+            }
+            _MockAPI.snapshots.append(snap)
+            self._send(201, snap)
+            return
+
+        if method == "GET" and len(parts) == 4 and parts[0] == "v1" and parts[1] == "machines" and parts[3] == "snapshots":
+            cursor = (parse_qs(urlparse(full_path).query).get("cursor") or [None])[0]
+            mine = [s for s in _MockAPI.snapshots if s.get("machine_id") == parts[2]]
+            if _MockAPI.paginate and cursor != "p2":
+                self._send(200, {"snapshots": mine[:1], "next_cursor": "p2"})
+                return
+            page = mine[1:] if cursor == "p2" else mine
+            self._send(200, {"snapshots": page, "next_cursor": None})
+            return
+
         if method == "GET" and path.startswith("/v1/machines/") and "/execs" not in path:
             mid = path.split("/")[3]
+            if len(parts) != 3:
+                self._send(404, {"detail": f"no mock for {method} {path}"})
+                return
             m = _MockAPI.machines.get(mid)
             if not m:
                 self._send(404, {"detail": "not found", "code": "not_found"})
                 return
+            if m.get("state") in ("pending", "provisioning", "starting"):
+                _MockAPI.machine_gets += 1
+                if _MockAPI.promote_after and _MockAPI.machine_gets >= _MockAPI.promote_after:
+                    m["state"] = "running"
             self._send(200, m)
             return
 
@@ -406,6 +519,9 @@ class SDKTest(unittest.TestCase):
         _MockAPI.jobs.clear()
         _MockAPI.job_gone = None
         _MockAPI.output_gone = None
+        _MockAPI.snapshots = []
+        _MockAPI.promote_after = 0
+        _MockAPI.machine_gets = 0
         # Production waits a few seconds on GET 404 after a dropped POST. Zero
         # here so a genuine miss (nothing started) stays a fast test.
         sandbox_mod._START_LOOKUP_SECONDS = 0.0
@@ -1054,6 +1170,130 @@ class SDKTest(unittest.TestCase):
     def test_connect_missing_is_not_found(self) -> None:
         with self.assertRaises(NotFoundError):
             Sandbox.connect("nope", api_key="k", base_url=self.base)
+
+    def test_quotas_keep_unknown_fields(self) -> None:
+        c = Client(api_key="k", base_url=self.base)
+        quotas = c.get_quotas()
+        self.assertEqual(quotas["tier"], "free")
+        self.assertEqual(quotas["quotas"][0]["name"], "machines")
+        self.assertEqual(quotas["per_machine"]["vcpus"], 2)
+        self.assertEqual(quotas["future_field"], "kept")
+        self.assertEqual(_MockAPI.log[-1]["path"], "/v1/quotas")
+
+    def test_images_keep_unknown_fields(self) -> None:
+        c = Client(api_key="k", base_url=self.base)
+        images = c.list_images()
+        self.assertEqual(images[0]["name"], "base")
+        self.assertEqual(images[0]["future"], 1)
+        self.assertEqual(_MockAPI.log[-1]["path"], "/v1/images")
+
+    def test_null_images_is_empty_list(self) -> None:
+        # Counter-guard: unwrapping must not throw when the catalog is null.
+        c = Client(api_key="k", base_url=self.base)
+        _MockAPI.fail_next = {"status": 200, "body": {"images": None}}
+        self.assertEqual(c.list_images(), [])
+
+    def test_stop_and_boot_are_not_exec_start(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        sb.stop()
+        stop = _MockAPI.log[-1]
+        self.assertEqual(stop["method"], "POST")
+        self.assertEqual(stop["path"], f"/v1/machines/{sb.id}/stop")
+        self.assertEqual(sb.state, "stopped")
+        sb.boot()
+        boot = _MockAPI.log[-1]
+        self.assertEqual(boot["method"], "POST")
+        self.assertEqual(boot["path"], f"/v1/machines/{sb.id}/start")
+        self.assertEqual(sb.state, "running")
+        sb.start("echo hi")
+        started = _MockAPI.log[-1]
+        self.assertTrue(started["path"].endswith("/execs"))
+        self.assertEqual(started["body"]["script"], "echo hi")
+
+    def test_root_volume_id_survives_create_without_echo(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base, root_volume_id="vol-abc")
+        self.assertEqual(sb.root_volume_id, "vol-abc")
+        self.assertNotIn("root_volume_id", _MockAPI.machines[sb.id])
+        # A later read that omits the field must not wipe it.
+        sb.wait(5, poll_interval=30)
+        self.assertEqual(sb.root_volume_id, "vol-abc")
+
+    def test_connect_keeps_root_volume_and_does_not_wait(self) -> None:
+        _MockAPI.machines["m-9"] = {
+            "id": "m-9",
+            "state": "provisioning",
+            "root_volume_id": "vol-keep",
+        }
+        sb = Sandbox.connect("m-9", api_key="k", base_url=self.base)
+        self.assertEqual(sb.state, "provisioning")
+        self.assertEqual(sb.root_volume_id, "vol-keep")
+        gets = [x for x in _MockAPI.log if x["method"] == "GET"]
+        self.assertEqual(len(gets), 1)
+
+    def test_wait_returns_immediately_when_running(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        started = __import__("time").monotonic()
+        sb.wait(30, poll_interval=30)
+        self.assertLess(__import__("time").monotonic() - started, 2)
+        self.assertEqual(sb.state, "running")
+
+    def test_wait_fails_immediately_when_stopped_or_error(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        for state in ("stopped", "error"):
+            _MockAPI.machines[sb.id]["state"] = state
+            _MockAPI.log.clear()
+            started = __import__("time").monotonic()
+            with self.assertRaises(SistemoError) as cm:
+                sb.wait(30, poll_interval=30)
+            self.assertLess(__import__("time").monotonic() - started, 2)
+            self.assertIn(state, str(cm.exception))
+            self.assertNotIsInstance(cm.exception, MachineTimeout)
+            self.assertEqual(len(_MockAPI.log), 1)
+
+    def test_wait_polls_until_running(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.machines[sb.id]["state"] = "starting"
+        _MockAPI.machine_gets = 0
+        _MockAPI.promote_after = 2
+        sb.wait(5, poll_interval=0.01)
+        self.assertEqual(sb.state, "running")
+        self.assertGreaterEqual(_MockAPI.machine_gets, 2)
+
+    def test_wait_deadline_is_required_and_enforced(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        _MockAPI.machines[sb.id]["state"] = "provisioning"
+        with self.assertRaises(SistemoError):
+            sb.wait(None)  # type: ignore[arg-type]
+        with self.assertRaises(MachineTimeout):
+            sb.wait(0, poll_interval=30)
+        self.assertEqual(sb.state, "provisioning")
+
+    def test_snapshots_round_trip_and_page(self) -> None:
+        sb = Sandbox(api_key="k", base_url=self.base)
+        created = sb.create_snapshot("before")
+        self.assertEqual(created["name"], "before")
+        self.assertEqual(created["extra"], "kept")
+        self.assertEqual(_MockAPI.log[-1]["path"], f"/v1/machines/{sb.id}/snapshots")
+        page = sb.list_snapshots()
+        self.assertIsInstance(page, Page)
+        self.assertEqual(page[0]["id"], created["id"])
+        restored = sb.restore_snapshot(created["id"])
+        self.assertEqual(_MockAPI.log[-1]["path"], f"/v1/snapshots/{created['id']}/restore")
+        self.assertTrue(restored["restored"])
+        deleted = sb.delete_snapshot(created["id"])
+        self.assertEqual(deleted["status"], "deleted")
+        c = Client(api_key="k", base_url=self.base)
+        _MockAPI.paginate = True
+        first = c.list_snapshots(limit=1)
+        self.assertEqual(first.next_cursor, "p2")
+        second = c.list_snapshots(cursor=first.next_cursor)
+        self.assertIsNone(second.next_cursor)
+        self.assertEqual([s["id"] for s in c.iter_snapshots()], ["s1", "s2"])
+
+    def test_snapshot_list_null_is_empty(self) -> None:
+        c = Client(api_key="k", base_url=self.base)
+        _MockAPI.fail_next = {"status": 200, "body": {"snapshots": None, "next_cursor": None}}
+        self.assertEqual(c.list_snapshots(), [])
 
 
 class IncompleteBodyTest(unittest.TestCase):

@@ -83,8 +83,9 @@ try {
 ```
 
 `QuotaExceededError` means an account limit was reached; `detail` names which
-dimension bound and how much is in use, and `GET /v1/quotas` reports every limit
-alongside current usage. `InsufficientBalanceError` is HTTP 402 (top up); it is
+dimension bound and how much is in use. `client.getQuotas()` is
+`GET /v1/quotas`: `tier`, `quotas` (used and limit per dimension), and
+`per_machine`. `InsufficientBalanceError` is HTTP 402 (top up); it is
 not a quota refusal and not an auth failure.
 
 Every request sends `X-Request-Id`. Quote `e.requestId` when you contact support.
@@ -109,6 +110,55 @@ for await (const vol of c.iterVolumes()) {
   console.log(vol.id);
 }
 ```
+
+## Power, wait, snapshots, images
+
+`stop()` powers the machine off (`POST /v1/machines/{id}/stop`). `boot()`
+powers it back on (`POST /v1/machines/{id}/start`). `boot()` is not
+`start()`: `start(script)` runs a command inside the guest.
+
+`connect()` is one GET and does not wait. `wait(timeoutMs)` polls
+`GET /v1/machines/{id}` until `running`. `timeoutMs` is required.
+A machine that is `stopped`, `stopping`, `error`, `destroyed`, or
+`destroying` fails immediately — waiting will not start it; call `boot()`
+for a stopped machine. Past the deadline the error is `MachineTimeout`.
+Create already returns a running machine.
+
+```ts
+import { Client, Sandbox } from "@sistemo/sdk";
+
+const sb = await Sandbox.connect(machineId);
+await sb.stop();
+await sb.boot();
+await sb.wait(30_000);
+
+const snap = await sb.createSnapshot("before");   // POST /v1/machines/{id}/snapshots
+const page = await sb.listSnapshots();             // { snapshots, nextCursor }
+await sb.restoreSnapshot(snap.id);                 // POST /v1/snapshots/{id}/restore
+await sb.deleteSnapshot(snap.id);                  // DELETE /v1/snapshots/{id}
+
+for (const image of await new Client().listImages()) {  // GET /v1/images
+  console.log(image.name);                         // pass as stack when creating
+}
+```
+
+`rootVolumeId` is kept on the instance after `create` and `connect`.
+The create response does not include it; the value is the option you
+passed until a later response names one.
+
+`await using` calls `close()` on Node 24 and later. A close error is
+swallowed, matching Python `with`, so it cannot mask the error from the
+block:
+
+```js
+{
+  await using sb = await Sandbox.create();
+  await sb.run("uname -a");
+}
+```
+
+On Node 18–22 the method is there (`sb[Symbol.asyncDispose]()`), but the
+`await using` syntax does not parse. Call `close()` in `finally`.
 
 ## Long-running commands
 
@@ -145,7 +195,9 @@ try {
 ```
 
 The handle outlives the process that created it. Reconnect with
-`Sandbox.connect(machineId)` (does not provision a new microVM), then
+`Sandbox.connect(machineId)` (one GET; it does not provision a new microVM
+and it does not wait for `running` — call `sb.wait(timeoutMs)` first if the
+machine may still be starting), then
 `sb.job(execId)` or `sb.jobs()` / `sb.iterJobs()`. `jobs()` is a real array
 plus `nextCursor`; the guest keeps at most 64, so the default page holds them
 all.
@@ -194,6 +246,16 @@ GET of the minted id (404 is retried for a few seconds — the API can 404 while
 still accepting the POST). If that GET also fails, `ExecStartUnconfirmed` carries it.
 
 ## Changelog
+
+### 0.1.8
+
+- `Sandbox.stop()` powers a machine off (`POST /v1/machines/{id}/stop`). `Sandbox.boot()` powers it on (`POST /v1/machines/{id}/start`). `start()` still starts a command.
+- `Sandbox.wait(timeoutMs)` polls until `running`. The deadline is required. `connect()` does not wait. `stopped`, `stopping`, `error`, `destroyed`, and `destroying` fail immediately. `MachineTimeout` is only the deadline.
+- Snapshot create, list, restore, and delete. Lists use `nextCursor`.
+- `Client.listImages()` returns the catalog from `GET /v1/images`.
+- `Client.getQuotas()` returns the body of `GET /v1/quotas`.
+- `rootVolumeId` is stored on the instance after create and connect.
+- `[Symbol.asyncDispose]` calls `close()` and swallows a close error, so `await using` matches Python `with`. The syntax needs Node 24 or later.
 
 ### 0.1.7
 
