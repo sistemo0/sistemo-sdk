@@ -3,8 +3,13 @@
  * Run: npm test  (builds dist/ then node --test test/sdk.test.mjs)
  */
 
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import {
   APIError,
@@ -22,6 +27,7 @@ import {
   SistemoError,
   TooManyExecsError,
   ExecStartUnconfirmed,
+  MachineTimeout,
   parseRetryAfter,
   retryDelayMs,
   startLookup,
@@ -41,6 +47,9 @@ const state = {
   jobs: new Map(),
   jobGone: null,
   outputGone: null,
+  snapshots: [],
+  promoteAfter: 0,
+  machineGets: 0,
 };
 
 function acceptExec(path, body) {
@@ -159,6 +168,8 @@ before(async () => {
       }
       const id = `m-${state.machines.size + 1}`;
       const m = { id, state: "running", ...(body || {}) };
+      // Production create does not echo root_volume_id.
+      delete m.root_volume_id;
       state.machines.set(id, m);
       if (idem) state.idemCreate.set(idem, id);
       send(res, 201, m);
@@ -268,12 +279,98 @@ before(async () => {
       return;
     }
 
+    const parts = path.split("/").filter(Boolean);
+
+    if (method === "GET" && path === "/v1/quotas") {
+      send(res, 200, {
+        tier: "free",
+        quotas: [{ name: "machines", used: 1, limit: 3, description: "Machines that exist." }],
+        per_machine: { vcpus: 2, memory_mb: 2048 },
+        future_field: "kept",
+      });
+      return;
+    }
+
+    if (method === "GET" && path === "/v1/images") {
+      send(res, 200, {
+        images: [{ name: "base", template_id: "base_2026", is_default: true, status: "ready", revision: "2026", future: 1 }],
+      });
+      return;
+    }
+
+    if (method === "GET" && path === "/v1/snapshots") {
+      const cursor = url.searchParams.get("cursor");
+      if (state.paginate) {
+        if (cursor === "p2") {
+          send(res, 200, { snapshots: [{ id: "s2", name: "later", state: "ready" }], next_cursor: null });
+        } else {
+          send(res, 200, { snapshots: [{ id: "s1", name: "before", state: "ready" }], next_cursor: "p2" });
+        }
+        return;
+      }
+      send(res, 200, { snapshots: state.snapshots, next_cursor: null });
+      return;
+    }
+
+    if (method === "POST" && parts.length === 4 && parts[0] === "v1" && parts[1] === "snapshots" && parts[3] === "restore") {
+      send(res, 200, { id: parts[2], state: "ready", restored: true });
+      return;
+    }
+
+    if (method === "DELETE" && parts.length === 3 && parts[0] === "v1" && parts[1] === "snapshots") {
+      send(res, 200, { status: "deleted" });
+      return;
+    }
+
+    if (method === "POST" && parts.length === 4 && parts[0] === "v1" && parts[1] === "machines" && (parts[3] === "stop" || parts[3] === "start")) {
+      const m = state.machines.get(parts[2]);
+      if (!m) {
+        send(res, 404, { detail: "not found", code: "not_found" });
+        return;
+      }
+      m.state = parts[3] === "stop" ? "stopped" : "running";
+      send(res, 200, m);
+      return;
+    }
+
+    if (method === "POST" && parts.length === 4 && parts[0] === "v1" && parts[1] === "machines" && parts[3] === "snapshots") {
+      const snap = {
+        id: `snap-${state.snapshots.length + 1}`,
+        name: body?.name,
+        state: "ready",
+        machine_id: parts[2],
+        extra: "kept",
+      };
+      state.snapshots.push(snap);
+      send(res, 201, snap);
+      return;
+    }
+
+    if (method === "GET" && parts.length === 4 && parts[0] === "v1" && parts[1] === "machines" && parts[3] === "snapshots") {
+      const cursor = url.searchParams.get("cursor");
+      const mine = state.snapshots.filter((s) => s.machine_id === parts[2]);
+      if (state.paginate && cursor !== "p2") {
+        send(res, 200, { snapshots: mine.slice(0, 1), next_cursor: "p2" });
+        return;
+      }
+      send(res, 200, { snapshots: cursor === "p2" ? mine.slice(1) : mine, next_cursor: null });
+      return;
+    }
+
     if (method === "GET" && path.startsWith("/v1/machines/") && !path.includes("/execs")) {
-      const id = path.split("/")[3];
+      if (parts.length !== 3) {
+        send(res, 404, { detail: `no mock for ${method} ${path}` });
+        return;
+      }
+      const id = parts[2];
       const m = state.machines.get(id);
       if (!m) {
         send(res, 404, { detail: "not found", code: "not_found" });
         return;
+      }
+      if (m.state === "pending" || m.state === "provisioning" || m.state === "starting") {
+        state.machineGets += 1;
+        if (state.promoteAfter && state.machineGets >= state.promoteAfter) m.state = "running";
       }
       send(res, 200, m);
       return;
@@ -310,6 +407,9 @@ beforeEach(() => {
   state.jobs.clear();
   state.jobGone = null;
   state.outputGone = null;
+  state.snapshots = [];
+  state.promoteAfter = 0;
+  state.machineGets = 0;
   // Production waits a few seconds on GET 404 after a dropped POST. Zero
   // here so a genuine miss (nothing started) stays a fast test.
   startLookup.ms = 0;
@@ -503,6 +603,8 @@ describe("Sandbox", () => {
     });
     const create = state.log.find((l) => l.path === "/v1/machines");
     assert.equal(create.body.root_volume_id, "vol-1");
+    assert.equal(sb.rootVolumeId, "vol-1");
+    assert.equal(state.machines.get(sb.id).root_volume_id, undefined);
     await sb.close(true);
     const del = state.log.find((l) => l.method === "DELETE");
     assert.match(del.fullPath, /preserve_storage=true/);
@@ -1085,6 +1187,199 @@ describe("409 is not a balance error", () => {
         assert.ok(!(err instanceof InsufficientBalanceError));
         return true;
       });
+    }
+  });
+});
+
+// `await using` is syntax. Node 20 (CI) and this host's Node 22 reject it at
+// parse time, so the proof lives in a child script and is skipped where the
+// runtime cannot parse it. Node 24 in CI runs it.
+function runtimeParsesAwaitUsing() {
+  const r = spawnSync(
+    process.execPath,
+    ["--input-type=module", "-e", "await using x = { async [Symbol.asyncDispose]() {} };"],
+    { encoding: "utf8" },
+  );
+  return r.status === 0;
+}
+const parsesAwaitUsing = runtimeParsesAwaitUsing();
+
+describe("0.1.8 surface", () => {
+  it("quotas keep unknown fields", async () => {
+    const c = new Client({ apiKey: "k", baseUrl });
+    const quotas = await c.getQuotas();
+    assert.equal(quotas.tier, "free");
+    assert.equal(quotas.quotas[0].name, "machines");
+    assert.equal(quotas.per_machine.vcpus, 2);
+    assert.equal(quotas.future_field, "kept");
+    assert.equal(state.log.at(-1).path, "/v1/quotas");
+  });
+
+  it("images keep unknown fields", async () => {
+    const c = new Client({ apiKey: "k", baseUrl });
+    const images = await c.listImages();
+    assert.equal(images[0].name, "base");
+    assert.equal(images[0].future, 1);
+    assert.equal(state.log.at(-1).path, "/v1/images");
+  });
+
+  it("null image catalog is an empty list", async () => {
+    const c = new Client({ apiKey: "k", baseUrl, maxRetries: 0 });
+    state.failNext = { status: 200, body: { images: null } };
+    assert.deepEqual(await c.listImages(), []);
+  });
+
+  it("stop and boot are not exec start", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    await sb.stop();
+    const stop = state.log.at(-1);
+    assert.equal(stop.method, "POST");
+    assert.equal(stop.path, `/v1/machines/${sb.id}/stop`);
+    assert.equal(sb.state, "stopped");
+    await sb.boot();
+    const boot = state.log.at(-1);
+    assert.equal(boot.path, `/v1/machines/${sb.id}/start`);
+    assert.equal(sb.state, "running");
+    await sb.start("echo hi");
+    const started = state.log.at(-1);
+    assert.ok(started.path.endsWith("/execs"));
+    assert.equal(started.body.script, "echo hi");
+  });
+
+  it("connect keeps rootVolumeId and does not wait", async () => {
+    state.machines.set("m-9", { id: "m-9", state: "provisioning", root_volume_id: "vol-keep" });
+    const sb = await Sandbox.connect("m-9", { apiKey: "k", baseUrl });
+    assert.equal(sb.state, "provisioning");
+    assert.equal(sb.rootVolumeId, "vol-keep");
+    assert.equal(state.log.filter((l) => l.method === "GET").length, 1);
+  });
+
+  it("wait returns immediately when running and keeps rootVolumeId", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl, rootVolumeId: "vol-1" });
+    const started = performance.now();
+    await sb.wait(30_000, { pollIntervalMs: 30_000 });
+    assert.ok(performance.now() - started < 2000);
+    assert.equal(sb.state, "running");
+    assert.equal(sb.rootVolumeId, "vol-1");
+  });
+
+  it("wait fails immediately when stopped or error", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    for (const st of ["stopped", "error"]) {
+      state.machines.get(sb.id).state = st;
+      state.log = [];
+      const started = performance.now();
+      await assert.rejects(() => sb.wait(30_000, { pollIntervalMs: 30_000 }), (e) => {
+        assert.ok(e instanceof SistemoError);
+        assert.ok(!(e instanceof MachineTimeout));
+        assert.match(e.message, new RegExp(st));
+        return true;
+      });
+      assert.ok(performance.now() - started < 2000);
+      assert.equal(state.log.length, 1);
+    }
+  });
+
+  it("wait polls until running", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.machines.get(sb.id).state = "starting";
+    state.machineGets = 0;
+    state.promoteAfter = 2;
+    await sb.wait(5000, { pollIntervalMs: 10 });
+    assert.equal(sb.state, "running");
+    assert.ok(state.machineGets >= 2);
+  });
+
+  it("wait requires a deadline and enforces it", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    state.machines.get(sb.id).state = "provisioning";
+    await assert.rejects(() => sb.wait(undefined), SistemoError);
+    await assert.rejects(() => sb.wait(0, { pollIntervalMs: 30_000 }), MachineTimeout);
+    assert.equal(sb.state, "provisioning");
+  });
+
+  it("snapshots round-trip and page", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    const created = await sb.createSnapshot("before");
+    assert.equal(created.name, "before");
+    assert.equal(created.extra, "kept");
+    assert.equal(state.log.at(-1).path, `/v1/machines/${sb.id}/snapshots`);
+    const page = await sb.listSnapshots();
+    assert.equal(page.snapshots[0].id, created.id);
+    const restored = await sb.restoreSnapshot(created.id);
+    assert.equal(state.log.at(-1).path, `/v1/snapshots/${created.id}/restore`);
+    assert.equal(restored.restored, true);
+    const deleted = await sb.deleteSnapshot(created.id);
+    assert.equal(deleted.status, "deleted");
+    const c = new Client({ apiKey: "k", baseUrl });
+    state.paginate = true;
+    const first = await c.listSnapshots({ limit: 1 });
+    assert.equal(first.nextCursor, "p2");
+    const second = await c.listSnapshots({ cursor: first.nextCursor });
+    assert.equal(second.nextCursor, null);
+    const ids = [];
+    for await (const s of c.iterSnapshots()) ids.push(s.id);
+    assert.deepEqual(ids, ["s1", "s2"]);
+  });
+
+  it("null snapshot list is empty", async () => {
+    const c = new Client({ apiKey: "k", baseUrl, maxRetries: 0 });
+    state.failNext = { status: 200, body: { snapshots: null, next_cursor: null } };
+    assert.deepEqual((await c.listSnapshots()).snapshots, []);
+  });
+
+  it("asyncDispose closes and swallows a close error", async () => {
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl });
+    const id = sb.id;
+    await sb[Symbol.asyncDispose]();
+    assert.equal(state.machines.has(id), false);
+
+    // maxRetries: 0 — DELETE retries 5xx, and a retry would hide the error
+    // this is supposed to swallow.
+    const sb2 = await Sandbox.create({ apiKey: "k", baseUrl, maxRetries: 0 });
+    state.failNext = { status: 500, body: { detail: "no" } };
+    const mark = state.log.length;
+    await sb2[Symbol.asyncDispose]();
+    // The id is reused once the first machine is gone (`m-${size+1}`), so
+    // count only the deletes this call made.
+    const deletes = state.log.slice(mark).filter((l) => l.method === "DELETE");
+    assert.equal(deletes.length, 1);
+    assert.equal(state.machines.has(sb2.id), true);
+  });
+
+  it("await using runs close", { skip: !parsesAwaitUsing }, async () => {
+    // A child, not this file: `await using` must not live in a module Node 20
+    // has to parse. spawn (not spawnSync) so this process can still serve the mock.
+    const dir = mkdtempSync(join(tmpdir(), "sdk-using-"));
+    const file = join(dir, "use.mjs");
+    const sdk = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+    writeFileSync(
+      file,
+      `import { Sandbox } from ${JSON.stringify(sdk)};
+const baseUrl = process.argv[2];
+{
+  await using sb = await Sandbox.create({ apiKey: "k", baseUrl });
+  console.log(sb.id);
+}
+`,
+    );
+    try {
+      const r = await new Promise((resolve) => {
+        const child = spawn(process.execPath, [file, baseUrl]);
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d) => {
+          stdout += d;
+        });
+        child.stderr.on("data", (d) => {
+          stderr += d;
+        });
+        child.on("close", (status) => resolve({ status, stdout, stderr }));
+      });
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(state.machines.has(r.stdout.trim()), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

@@ -164,6 +164,14 @@ class MachineNotRunningError(APIError):
     """
 
 
+class MachineTimeout(SistemoError):
+    """``Sandbox.wait()`` reached its deadline before the machine was running.
+
+    The machine is unchanged. This is the caller's deadline, not a failure
+    reported by the API.
+    """
+
+
 def api_error(
     status: int,
     detail: str,

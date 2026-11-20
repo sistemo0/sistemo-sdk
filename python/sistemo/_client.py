@@ -390,3 +390,39 @@ class Client:
     def delete_volume(self, volume_id: str) -> dict:
         """Delete a detached volume."""
         return self.request("DELETE", f"/v1/volumes/{volume_id}")
+
+    def get_quotas(self) -> dict:
+        """Account limits and current usage (``GET /v1/quotas``).
+
+        The body is returned as the API sent it (``tier``, ``quotas``,
+        ``per_machine``). Unknown fields are kept.
+        """
+        return self.request("GET", "/v1/quotas")
+
+    def list_images(self) -> list:
+        """The image catalog (``GET /v1/images``).
+
+        Each item is one catalog image. Pass its ``name`` as ``stack`` when
+        creating a sandbox. An empty catalog is ``[]``, never ``None``.
+        """
+        out = self.request("GET", "/v1/images")
+        return list(out.get("images") or [])
+
+    def list_snapshots(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> Page:
+        """List the account's snapshots. Same paging contract as :meth:`list_volumes`."""
+        out = self.request("GET", _qs("/v1/snapshots", cursor=cursor, limit=limit))
+        return Page(out.get("snapshots") or [], out.get("next_cursor"))
+
+    def iter_snapshots(self, *, limit: int | None = None) -> Iterator[dict]:
+        """Yield every snapshot, following ``next_cursor`` until the last page."""
+        yield from self._iter_pages(self.list_snapshots, limit=limit)
+
+    def restore_snapshot(self, snapshot_id: str) -> dict:
+        """Roll a volume back to this snapshot (``POST /v1/snapshots/{id}/restore``)."""
+        return self.request("POST", f"/v1/snapshots/{snapshot_id}/restore")
+
+    def delete_snapshot(self, snapshot_id: str) -> dict:
+        """Delete a snapshot (``DELETE /v1/snapshots/{id}``)."""
+        return self.request("DELETE", f"/v1/snapshots/{snapshot_id}")

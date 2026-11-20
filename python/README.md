@@ -96,8 +96,9 @@ except APIError as e:
 Both `QuotaExceededError` and `AuthError` arrive as HTTP 403, so **catch
 `QuotaExceededError` first** — it is a subclass of `APIError`, not of `AuthError`,
 precisely because the two need opposite handling: an auth failure never succeeds
-on retry, a quota refusal does once you free something. `GET /v1/quotas` reports
-every limit alongside current usage. `InsufficientBalanceError` is HTTP 402
+on retry, a quota refusal does once you free something. `Client.get_quotas()`
+is `GET /v1/quotas`: `tier`, `quotas` (used and limit per dimension), and
+`per_machine`. `InsufficientBalanceError` is HTTP 402
 (top up); it is not a quota refusal and not an auth failure.
 
 Every request sends `X-Request-Id`. Quote `e.request_id` when you contact support.
@@ -121,6 +122,40 @@ page = c.list_volumes(cursor=page.next_cursor, limit=50)
 for vol in c.iter_volumes():
     print(vol["id"])
 ```
+
+## Power, wait, snapshots, images
+
+`stop()` powers the machine off (`POST /v1/machines/{id}/stop`). `boot()`
+powers it back on (`POST /v1/machines/{id}/start`). `boot()` is not
+`start()`: `start(script)` runs a command inside the guest.
+
+`connect()` is one GET and does not wait. `wait(timeout)` polls
+`GET /v1/machines/{id}` until `running`. `timeout` is required (seconds).
+A machine that is `stopped`, `stopping`, `error`, `destroyed`, or
+`destroying` fails immediately — waiting will not start it; call `boot()`
+for a stopped machine. Past the deadline the error is `MachineTimeout`.
+Create already returns a running machine.
+
+```python
+from sistemo import Client, Sandbox
+
+sb = Sandbox.connect(machine_id)
+sb.stop()
+sb.boot()
+sb.wait(30)
+
+snap = sb.create_snapshot("before")     # POST /v1/machines/{id}/snapshots
+for s in sb.list_snapshots():            # Page, same next_cursor contract
+    print(s["id"])
+sb.restore_snapshot(snap["id"])          # POST /v1/snapshots/{id}/restore
+sb.delete_snapshot(snap["id"])           # DELETE /v1/snapshots/{id}
+
+for image in Client().list_images():     # GET /v1/images
+    print(image["name"])                 # pass as stack= when creating
+```
+
+`root_volume_id` on the instance is the id you passed to `Sandbox(...)`,
+or the one a later response named. The create response does not include it.
 
 ## Long-running commands
 
@@ -151,7 +186,9 @@ with Sandbox() as sb:
 ```
 
 The handle outlives the process that created it. Reconnect with
-`Sandbox.connect(machine_id)` (does not provision a new microVM), then
+`Sandbox.connect(machine_id)` (one GET; it does not provision a new microVM
+and it does not wait for `running` — call `sb.wait(timeout)` first if the
+machine may still be starting), then
 `sb.job(exec_id)` or `sb.jobs()` / `sb.iter_jobs()`. `jobs()` returns a `Page`
 (a list with `next_cursor`); the guest keeps at most 64, so the default page
 holds them all.
@@ -200,6 +237,14 @@ GET of the minted id (404 is retried for a few seconds — the API can 404 while
 still accepting the POST). If that GET also fails, `ExecStartUnconfirmed` carries it.
 
 ## Changelog
+
+### 0.1.8
+
+- `Sandbox.stop()` powers a machine off (`POST /v1/machines/{id}/stop`). `Sandbox.boot()` powers it on (`POST /v1/machines/{id}/start`). `start()` still starts a command.
+- `Sandbox.wait(timeout)` polls until `running`. The deadline is required. `connect()` does not wait. `stopped`, `stopping`, `error`, `destroyed`, and `destroying` fail immediately. `MachineTimeout` is only the deadline.
+- Snapshot create, list, restore, and delete. Lists use `next_cursor`.
+- `Client.list_images()` returns the catalog from `GET /v1/images`.
+- `Client.get_quotas()` returns the body of `GET /v1/quotas`.
 
 ### 0.1.7
 
