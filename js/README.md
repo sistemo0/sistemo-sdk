@@ -190,9 +190,14 @@ is a 409 and returns the existing job, not a second run. If start throws
 The 17th concurrent command is `TooManyExecsError` (`too_many_execs`): wait for
 one to finish; a new id does not help. `POST /execs` is never retried — not on
 HTTP 5xx/429, and not on a dropped connection. A dropped start is recovered by
-GET of the minted id; if that GET also fails, `ExecStartUnconfirmed` carries it.
+GET of the minted id (404 is retried for a few seconds — the API can 404 while
+still accepting the POST). If that GET also fails, `ExecStartUnconfirmed` carries it.
 
 ## Changelog
+
+### 0.1.7
+
+- GET of a minted `execId` after a dropped start retries 404 for a few seconds. The API can 404 for 0.2–0.5 s while still accepting the POST; a single GET treated that as "nothing started" while the command ran to completion.
 
 ### 0.1.6
 

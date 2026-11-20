@@ -13,6 +13,7 @@ import {
   JobTimeout,
   NotFoundError,
   Sandbox,
+  startLookup,
 } from "../dist/index.js";
 
 const scene = {};
@@ -81,6 +82,8 @@ after(() => server.close());
 beforeEach(() => {
   for (const k of Object.keys(scene)) delete scene[k];
   scene.job = jobRec();
+  startLookup.ms = 0;
+  startLookup.intervalMs = 0;
 });
 
 // A real Sandbox via the documented entry point, so the test exercises the

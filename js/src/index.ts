@@ -17,7 +17,19 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.1.6";
+const USER_AGENT = "@sistemo/sdk/0.1.7";
+
+/**
+ * After a POST /execs whose ACK was lost, GET of the minted id retries 404
+ * for this long. The API can 404 for 0.2–0.5 s while still accepting the
+ * request; a single GET treated that as "nothing started" while the command
+ * finished.
+ *
+ * Never re-POST — even with the same id — once the request body may have
+ * left this process. The minted execId is the handle we already hold: GET it.
+ * Tests set both to 0 so a genuine miss stays fast.
+ */
+export const startLookup = { ms: 3000, intervalMs: 200 };
 
 const RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -216,6 +228,12 @@ function newIdempotencyKey(): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Monotonic ms. `Date.now()` can jump; the 404-retry deadline must not. */
+function monotonicMs(): number {
+  const p = (globalThis as { performance?: { now?: () => number } }).performance;
+  return typeof p?.now === "function" ? p.now() : Date.now();
 }
 
 /** Append `limit` / `cursor` when set. The API names the query `cursor`. */
@@ -680,8 +698,9 @@ export class Sandbox {
    * This is start + wait on a guest job (`POST /execs`). Default timeout 120s,
    * ceiling 24 hours. A proxy never holds the connection for the whole command.
    * HTTP 5xx/429 and dropped connections on start are not retried. A dropped
-   * start is recovered by GET of the minted id. If the machine stops while
-   * waiting, this returns `lost: true` rather than throwing 409.
+   * start is recovered by GET of the minted id (404 is retried for a few
+   * seconds — the API can 404 while still accepting the POST). If the machine
+   * stops while waiting, this returns `lost: true` rather than throwing 409.
    */
   async run(
     script: string,
@@ -738,8 +757,8 @@ export class Sandbox {
    *
    * ⚠ On {@link ExecStartUnconfirmed} the command **may be running**. The error
    * carries `execId`; poll it with {@link job} rather than starting over. A
-   * dropped connection on POST is recovered the same way: GET that id, never
-   * re-POST.
+   * dropped connection on POST is recovered the same way: GET that id (404
+   * retried briefly), never re-POST.
    */
   async start(
     script: string,
@@ -781,24 +800,38 @@ export class Sandbox {
   /**
    * GET the minted id after a POST whose outcome we cannot trust.
    *
-   * Found → that job. 404 → the original error (nothing started). Any other
-   * GET failure → {@link ExecStartUnconfirmed} so the caller has the handle.
+   * Found → that job. 404 is retried for a few seconds (the API can 404 while
+   * still accepting the POST). After that, 404 → the original error (nothing
+   * started). Any other GET failure → {@link ExecStartUnconfirmed} so the
+   * caller has the handle. Never re-POST — even with the same id — because
+   * the body may already be in flight.
    */
   private async jobAfterUnconfirmedStart(execId: string, original: unknown): Promise<Job> {
-    try {
-      const rec = await this.client.request<JobRecord>(
-        "GET",
-        `/v1/machines/${this.id}/execs/${execId}`,
-      );
-      return new Job(this.client, this.id, rec);
-    } catch (inner) {
-      if (inner instanceof NotFoundError) throw original;
-      throw new ExecStartUnconfirmed(
-        503,
-        "connection dropped while starting; the command may be running",
-        undefined,
-        { exec_id: execId },
-      );
+    const postRid =
+      (original instanceof APIError ? original.requestId : undefined) ?? this.client.lastRequestId;
+    const deadline = monotonicMs() + startLookup.ms;
+    for (;;) {
+      try {
+        const rec = await this.client.request<JobRecord>(
+          "GET",
+          `/v1/machines/${this.id}/execs/${execId}`,
+        );
+        return new Job(this.client, this.id, rec);
+      } catch (inner) {
+        if (inner instanceof NotFoundError) {
+          const remaining = deadline - monotonicMs();
+          if (remaining <= 0) throw original;
+          await sleep(Math.min(startLookup.intervalMs, remaining));
+          continue;
+        }
+        throw new ExecStartUnconfirmed(
+          503,
+          "connection dropped while starting; the command may be running",
+          undefined,
+          { exec_id: execId },
+          postRid ? { requestId: postRid } : undefined,
+        );
+      }
     }
   }
 

@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from sistemo import Sandbox
+import sistemo.sandbox as sandbox_mod
 from sistemo.errors import (
     AsyncExecUnsupportedError,
     ExecStartUnconfirmed,
@@ -125,6 +126,8 @@ class AsyncExecTest(unittest.TestCase):
     def setUp(self):
         SCENE.clear()
         SCENE["job"] = job_rec()
+        sandbox_mod._START_LOOKUP_SECONDS = 0.0
+        sandbox_mod._START_LOOKUP_INTERVAL = 0.0
 
     def sandbox(self) -> Sandbox:
         return Sandbox(api_key="sk_live_test", base_url=self.base)

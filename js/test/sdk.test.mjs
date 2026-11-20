@@ -24,6 +24,7 @@ import {
   ExecStartUnconfirmed,
   parseRetryAfter,
   retryDelayMs,
+  startLookup,
 } from "../dist/index.js";
 
 const state = {
@@ -36,6 +37,7 @@ const state = {
   paginate: false,
   dropCount: 0,
   dropStoreExec: false,
+  execLookup404s: 0,
   jobs: new Map(),
   jobGone: null,
   outputGone: null,
@@ -213,6 +215,11 @@ before(async () => {
 
     if (method === "GET" && path.includes("/execs/")) {
       const eid = path.split("/")[5];
+      if (state.execLookup404s > 0) {
+        state.execLookup404s -= 1;
+        send(res, 404, { detail: "not found" });
+        return;
+      }
       const job = state.jobs.get(eid);
       if (!job) {
         send(res, 404, { detail: "not found" });
@@ -299,9 +306,14 @@ beforeEach(() => {
   state.paginate = false;
   state.dropCount = 0;
   state.dropStoreExec = false;
+  state.execLookup404s = 0;
   state.jobs.clear();
   state.jobGone = null;
   state.outputGone = null;
+  // Production waits a few seconds on GET 404 after a dropped POST. Zero
+  // here so a genuine miss (nothing started) stays a fast test.
+  startLookup.ms = 0;
+  startLookup.intervalMs = 0;
   delete process.env.SISTEMO_API_KEY;
   delete process.env.SISTEMO_BASE_URL;
 });
@@ -651,6 +663,49 @@ describe("Sandbox", () => {
     );
   });
 
+  it("run() recovers a dropped start after lookup 404s", async () => {
+    startLookup.ms = 2000;
+    startLookup.intervalMs = 0;
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl, timeoutMs: 500 });
+    state.log = [];
+    state.dropStoreExec = true;
+    state.dropCount = 1;
+    state.execLookup404s = 2;
+    const r = await sb.run("echo recovered");
+    assert.equal(r.ok, true);
+    assert.match(r.stdout, /echo recovered/);
+    assert.equal(r.lost, false);
+    const posts = state.log.filter((l) => l.method === "POST" && l.path.endsWith("/execs"));
+    assert.equal(posts.length, 1);
+    const jobGets = state.log.filter(
+      (l) => l.method === "GET" && l.path.includes("/execs/") && !l.path.endsWith("/output"),
+    );
+    assert.ok(
+      jobGets.length >= 3,
+      "two 404s then a hit — a single GET would have reported nothing started",
+    );
+  });
+
+  it("dropped start 404s for the whole window is the original error", async () => {
+    startLookup.ms = 50;
+    startLookup.intervalMs = 0;
+    const sb = await Sandbox.create({ apiKey: "k", baseUrl, timeoutMs: 500 });
+    state.log = [];
+    state.dropCount = 1;
+    await assert.rejects(() => sb.run("echo once"), (e) => {
+      assert.ok(e instanceof SistemoError);
+      assert.ok(!(e instanceof ExecStartUnconfirmed));
+      assert.match(e.message, /connection error/);
+      return true;
+    });
+    const posts = state.log.filter((l) => l.method === "POST" && l.path.endsWith("/execs"));
+    assert.equal(posts.length, 1);
+    const jobGets = state.log.filter(
+      (l) => l.method === "GET" && l.path.includes("/execs/") && !l.path.endsWith("/output"),
+    );
+    assert.ok(jobGets.length >= 2, "the window must GET more than once before giving up");
+  });
+
   it("dropped start raises ExecStartUnconfirmed when GET also fails", async () => {
     const sb = await Sandbox.create({ apiKey: "k", baseUrl, timeoutMs: 500, maxRetries: 0 });
     state.log = [];
@@ -659,6 +714,7 @@ describe("Sandbox", () => {
     await assert.rejects(() => sb.start("echo hi"), (e) => {
       assert.ok(e instanceof ExecStartUnconfirmed);
       assert.ok(e.execId);
+      assert.ok(e.requestId, "the unconfirmed error must carry the POST request_id, not a blank 503");
       return true;
     });
     const posts = state.log.filter((l) => l.method === "POST" && l.path.endsWith("/execs"));
