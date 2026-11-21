@@ -106,9 +106,20 @@ class Sandbox:
 
         ``network="locked"`` limits outbound traffic to the hosts in ``allow``
         (HTTP and HTTPS only; an empty list means no outbound access). Omit it
-        for the default open network. ``secrets`` binds secrets by name; their
-        values reach this machine's commands as environment variables.
+        for the default open network. Creating from a ``root_volume_id`` whose
+        machine was locked needs an explicit ``network``.
+
+        ``secrets`` binds secrets by name; each becomes an environment variable
+        of that name in this machine's commands. A **box** secret's variable
+        holds the value, so code on the machine can read it. A **proxy** secret's
+        variable holds a placeholder (``sist_ph_…``): the real value is added only
+        on HTTPS to the secret's hosts, so a proxy secret needs
+        ``network="locked"`` with those hosts in ``allow``. Do not set
+        ``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``, ``CURL_CA_BUNDLE`` or
+        ``NODE_EXTRA_CA_CERTS`` in a command's ``env`` on such a machine — the
+        server sets them so HTTPS clients trust the machine's own CA.
         """
+        _check_network_args(network, allow)
         self._client = client or Client(api_key=api_key, base_url=base_url)
         body: dict = {
             "name": name,
@@ -382,12 +393,24 @@ class Sandbox:
         """Replace this machine's outbound policy
         (``POST /v1/machines/{id}/network``).
 
-        ``allow`` is the WHOLE new list. A running machine changes in place; a
-        stopped one gets the policy at its next start.
+        ``allow`` is the WHOLE new list — ``set_network("locked")`` with no
+        ``allow`` leaves the machine with no outbound access at all. A running
+        machine changes in place; a stopped one gets the policy at its next
+        start.
+
+        The call is a full replace, so it is retried on a dropped connection or
+        a 5xx/429. If it still fails, ``sb.network`` / ``sb.allow`` keep the OLD
+        policy even though the host may already have the new one (a 503 "the
+        new policy is installed but its secrets could not be delivered", or a
+        409 "changed state"): send the same call again — it converges.
         """
+        _check_network_args(network, allow)
         body = {"network": network, "allow": list(allow or [])}
+        # ⚠ An Idempotency-Key only so the client may retry: the server ignores
+        # it on this route, and re-sending a whole-list replace is harmless.
         self._apply_machine(
-            self._client.request("POST", f"/v1/machines/{self.id}/network", body)
+            self._client.request("POST", f"/v1/machines/{self.id}/network", body,
+                                 idempotency_key=str(uuid.uuid4()))
         )
         return self
 
@@ -506,11 +529,21 @@ class Sandbox:
             pass  # best-effort cleanup; never mask the original error
 
 
+def _check_network_args(network: str | None, allow) -> None:
+    """Refuse locally what the API would refuse, before anything is sent."""
+    if isinstance(allow, str):
+        # A bare string would be iterated into single characters.
+        raise TypeError("allow must be a list of host names, e.g. [\"pypi.org\"]")
+    if allow and network != "locked":
+        raise ValueError('allow only applies when network="locked"')
+
+
 class _Secrets:
     """The secrets bound to a machine — by NAME; values are never readable.
 
     ``sb.secrets.bind("STRIPE_KEY")`` makes the secret available to this
-    machine's next commands; ``unbind`` removes it. Secrets themselves are
+    machine's next commands — its value for a box secret, a placeholder for a
+    proxy secret (see ``Sandbox``); ``unbind`` removes it. Secrets themselves are
     created and rotated in the dashboard. Changes apply to the next command —
     one already running keeps the environment it started with.
     """

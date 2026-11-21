@@ -263,23 +263,39 @@ A refused plain-HTTP call gets `403` with `{"code": "egress_domain_not_allowed"}
 a refused HTTPS call has its connection closed. A running machine changes
 policy in place; a stopped one gets it at its next start.
 
+`set_network` is a full replace, so the SDK retries it on a dropped connection or a
+5xx/429. If it still fails, `sb.network` / `sb.allow` keep the old policy even
+though the host may already have the new one — send the same call again; it
+converges. A machine created from a kept root disk of a locked machine must
+say `network` explicitly (`network="locked"` or `"open"`) — the API refuses an implicit one.
+
 **Secrets** are created and rotated in the dashboard; their values are
 write-only and no API call ever returns one. The SDK binds them by name, and
 each bound secret reaches the machine's commands as an environment variable of
 the same name:
 
 ```python
-sb = Sandbox(secrets=["ORDERS_DB_URL"])
-sb.run('psql "$ORDERS_DB_URL" -c "select 1"')
+sb = Sandbox(secrets=["API_TOKEN"])
+sb.run('curl -sS -H "Authorization: Bearer $API_TOKEN" https://api.example.com/v1/orders')
 
-sb.secrets.bind("STRIPE_KEY")       # -> ["ORDERS_DB_URL", "STRIPE_KEY"]
-sb.secrets.unbind("ORDERS_DB_URL")  # -> ["STRIPE_KEY"]
+sb.secrets.bind("STRIPE_KEY")       # -> ["API_TOKEN", "STRIPE_KEY"]
+sb.secrets.unbind("API_TOKEN")      # -> ["STRIPE_KEY"]
 list(sb.secrets)                    # names only
 
 Client().list_secrets()             # names, custody, hosts, bound_machines — never a value
 ```
 
-⚠ A bound secret is readable by anything that runs on that machine — keep the
+**Box or proxy.** A **box** secret's variable holds the value. A **proxy**
+secret's variable holds a placeholder (`sist_ph_…`): the real value is added
+only on HTTPS to the secret's hosts, in the place it was created for (a bearer
+token, basic auth, a header or a query parameter), so code on the machine can
+use it but never read it. A proxy secret needs a locked machine with its hosts
+in `allow`. Do not set `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`
+or `NODE_EXTRA_CA_CERTS` in a command's env there — the server sets them so
+HTTPS clients trust the machine's own certificate authority. See
+[Proxy secrets](https://docs.sistemo.io/cloud/proxy-secrets/).
+
+⚠ A bound box secret is readable by anything that runs on that machine — keep the
 machine's code and its network policy as tight as the secret is sensitive.
 Binding changes the NEXT command; one already running keeps its environment.
 At most 16 per machine. Passing `env=` with the same name as a bound secret is
@@ -287,6 +303,12 @@ a `400`, never a silent override. Every bind and unbind is in the Activity feed
 (names only).
 
 ## Changelog
+
+### 0.2.1
+
+- `set_network` is retried on a dropped connection or a 5xx/429 (a full replace is safe to repeat).
+- A bare string for `allow` is a `TypeError` (it was split into characters), and `allow` without `network="locked"` is refused before anything is sent.
+- Docs: box vs proxy secrets, and the CA variables not to override.
 
 ### 0.2.0
 
