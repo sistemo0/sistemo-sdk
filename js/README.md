@@ -277,11 +277,11 @@ each bound secret reaches the machine's commands as an environment variable of
 the same name:
 
 ```ts
-const sb = await Sandbox.create({ secrets: ["ORDERS_DB_URL"] });
-await sb.run('psql "$ORDERS_DB_URL" -c "select 1"');
+const sb = await Sandbox.create({ secrets: ["API_TOKEN"] });
+await sb.run('curl -sS -H "Authorization: Bearer $API_TOKEN" https://api.example.com/v1/orders');
 
-await sb.secrets.bind("STRIPE_KEY");      // -> ["ORDERS_DB_URL", "STRIPE_KEY"]
-await sb.secrets.unbind("ORDERS_DB_URL"); // -> ["STRIPE_KEY"]
+await sb.secrets.bind("STRIPE_KEY");      // -> ["API_TOKEN", "STRIPE_KEY"]
+await sb.secrets.unbind("API_TOKEN");     // -> ["STRIPE_KEY"]
 sb.secrets.names;                         // names only
 
 await new Client().listSecrets();         // name, custody, hosts, bound_machines — never a value

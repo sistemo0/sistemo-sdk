@@ -269,11 +269,11 @@ each bound secret reaches the machine's commands as an environment variable of
 the same name:
 
 ```python
-sb = Sandbox(secrets=["ORDERS_DB_URL"])
-sb.run('psql "$ORDERS_DB_URL" -c "select 1"')
+sb = Sandbox(secrets=["API_TOKEN"])
+sb.run('curl -sS -H "Authorization: Bearer $API_TOKEN" https://api.example.com/v1/orders')
 
-sb.secrets.bind("STRIPE_KEY")       # -> ["ORDERS_DB_URL", "STRIPE_KEY"]
-sb.secrets.unbind("ORDERS_DB_URL")  # -> ["STRIPE_KEY"]
+sb.secrets.bind("STRIPE_KEY")       # -> ["API_TOKEN", "STRIPE_KEY"]
+sb.secrets.unbind("API_TOKEN")      # -> ["STRIPE_KEY"]
 list(sb.secrets)                    # names only
 
 Client().list_secrets()             # names, custody, hosts, bound_machines — never a value
