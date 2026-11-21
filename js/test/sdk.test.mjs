@@ -357,6 +357,32 @@ before(async () => {
       return;
     }
 
+    // Locked network + secrets (0.2.0).
+    if (method === "POST" && parts.length === 4 && parts[1] === "machines" && parts[3] === "network") {
+      const m = state.machines.get(parts[2]);
+      if (!m) return send(res, 404, { detail: "not found", code: "not_found" });
+      m.network = body?.network;
+      m.allow = body?.allow;
+      return send(res, 200, m);
+    }
+    if (method === "POST" && parts.length === 4 && parts[1] === "machines" && parts[3] === "secrets") {
+      const m = state.machines.get(parts[2]);
+      if (!m) return send(res, 404, { detail: "not found", code: "not_found" });
+      const names = (m.secrets || []).filter((n) => !(body?.unbind || []).includes(n));
+      for (const n of body?.bind || []) {
+        if (n === "NOPE") return send(res, 400, { detail: "no secret named NOPE", code: "validation_error" });
+        if (!names.includes(n)) names.push(n);
+      }
+      m.secrets = names.sort();
+      return send(res, 200, m);
+    }
+    if (method === "GET" && path.endsWith("/egress/activity")) {
+      return send(res, 200, { activity: [{ host: "evil.example", action: "blocked", at: "2026-11-21T12:00:00Z" }], complete: true });
+    }
+    if (method === "GET" && path === "/v1/secrets") {
+      return send(res, 200, { secrets: [{ name: "STRIPE_KEY", custody: "box", hosts: [], bound_machines: 0 }] });
+    }
+
     if (method === "GET" && path.startsWith("/v1/machines/") && !path.includes("/execs")) {
       if (parts.length !== 3) {
         send(res, 404, { detail: `no mock for ${method} ${path}` });
@@ -1414,5 +1440,61 @@ describe("version drift", () => {
       "the User-Agent must carry package.json's version — the WAF makes this " +
         "string load-bearing and a stale one is invisible until it 403s",
     );
+  });
+});
+
+describe("locked network and secrets (0.2.0)", () => {
+  const createBody = () => state.log.filter((e) => e.method === "POST" && e.path === "/v1/machines").at(-1).body;
+  const mk = (o = {}) => Sandbox.create({ apiKey: "sk_test", baseUrl, ...o });
+
+  it("omitted network sends nothing, so the default stays the server's", async () => {
+    const sb = await mk();
+    const body = createBody();
+    for (const k of ["network", "allow", "secrets"]) assert.equal(k in body, false, k);
+    assert.equal(sb.network, "open");
+  });
+
+  it("locked with an empty allow-list is sent as an empty list", async () => {
+    const sb = await mk({ network: "locked", allow: [] });
+    assert.equal(createBody().network, "locked");
+    assert.deepEqual(createBody().allow, []);
+    assert.equal(sb.network, "locked");
+  });
+
+  it("binds secrets on create and through sb.secrets", async () => {
+    const sb = await mk({ network: "locked", allow: ["api.example.com"], secrets: ["STRIPE_KEY"] });
+    assert.deepEqual(createBody().secrets, ["STRIPE_KEY"]);
+    assert.deepEqual(sb.secrets.names, ["STRIPE_KEY"]);
+    assert.deepEqual(await sb.secrets.bind("DB_URL"), ["DB_URL", "STRIPE_KEY"]);
+    assert.deepEqual(await sb.secrets.unbind("STRIPE_KEY"), ["DB_URL"]);
+    assert.deepEqual(state.log.at(-1).body, { bind: [], unbind: ["STRIPE_KEY"] });
+  });
+
+  it("an unknown secret name is an APIError and changes nothing", async () => {
+    const sb = await mk();
+    await assert.rejects(sb.secrets.bind("NOPE"), (e) => e instanceof APIError && e.status === 400);
+    assert.deepEqual(sb.secrets.names, []);
+  });
+
+  it("setNetwork sends the whole list; egress passes its filters", async () => {
+    const sb = await mk();
+    await sb.setNetwork("locked", ["pypi.org", "files.pythonhosted.org"]);
+    assert.deepEqual(state.log.at(-1).body, { network: "locked", allow: ["pypi.org", "files.pythonhosted.org"] });
+    assert.deepEqual([sb.network, sb.allow], ["locked", ["pypi.org", "files.pythonhosted.org"]]);
+    const log = await sb.egress({ action: "blocked", limit: 10 });
+    assert.equal(log.activity[0].host, "evil.example");
+    assert.equal(state.log.at(-1).fullPath, `/v1/machines/${sb.id}/egress/activity?action=blocked&limit=10`);
+  });
+
+  it("connect reads network and secrets", async () => {
+    const sb = await mk({ network: "locked", allow: ["a.example.com"], secrets: ["K"] });
+    const again = await Sandbox.connect(sb.id, { apiKey: "sk_test", baseUrl });
+    assert.deepEqual([again.network, again.allow, again.secrets.names], ["locked", ["a.example.com"], ["K"]]);
+  });
+
+  it("listSecrets returns names, never values", async () => {
+    const list = await new Client({ apiKey: "sk_test", baseUrl }).listSecrets();
+    assert.equal(list[0].name, "STRIPE_KEY");
+    assert.equal("value" in list[0], false);
   });
 });

@@ -98,7 +98,17 @@ class Sandbox:
         metadata: dict | None = None,
         root_volume_id: str = "",
         idempotency_key: str | None = None,
+        network: str | None = None,
+        allow: list[str] | None = None,
+        secrets: list[str] | None = None,
     ):
+        """Create a machine.
+
+        ``network="locked"`` limits outbound traffic to the hosts in ``allow``
+        (HTTP and HTTPS only; an empty list means no outbound access). Omit it
+        for the default open network. ``secrets`` binds secrets by name; their
+        values reach this machine's commands as environment variables.
+        """
         self._client = client or Client(api_key=api_key, base_url=base_url)
         body: dict = {
             "name": name,
@@ -112,6 +122,14 @@ class Sandbox:
         # fresh template clone. Size/stack come from the volume.
         if root_volume_id:
             body["root_volume_id"] = root_volume_id
+        # ⚠ Sent only when given: a create without them is byte-for-byte the
+        # request 0.1.x made, so the open default stays the server's default.
+        if network is not None:
+            body["network"] = network
+        if allow is not None:
+            body["allow"] = list(allow)
+        if secrets:
+            body["secrets"] = list(secrets)
         # Stable key for this create so client/network retries cannot double-boot.
         key = idempotency_key or str(uuid.uuid4())
         machine = self._client.request(
@@ -128,6 +146,10 @@ class Sandbox:
         self.state: str = str(machine.get("state", "") or "")
         self.root_volume_id: str = root_volume_id
         self._create_idempotency_key = key
+        self.network: str = "open"
+        self.allow: list[str] = []
+        self.secrets = _Secrets(self)
+        self._apply_machine(machine)
 
     @classmethod
     def connect(
@@ -162,6 +184,10 @@ class Sandbox:
         self.state = str(rec.get("state", "") or "")
         self.root_volume_id = str(rec.get("root_volume_id") or "")
         self._create_idempotency_key = ""
+        self.network = "open"
+        self.allow = []
+        self.secrets = _Secrets(self)
+        self._apply_machine(rec)
         return self
 
     def run(
@@ -345,6 +371,37 @@ class Sandbox:
             self.state = str(rec["state"])
         if rec.get("root_volume_id"):
             self.root_volume_id = str(rec["root_volume_id"])
+        if rec.get("network"):
+            self.network = str(rec["network"])
+        if isinstance(rec.get("allow"), list):
+            self.allow = [str(h) for h in rec["allow"]]
+        if isinstance(rec.get("secrets"), list):
+            self.secrets._names = [str(n) for n in rec["secrets"]]
+
+    def set_network(self, network: str, allow: list[str] | None = None) -> "Sandbox":
+        """Replace this machine's outbound policy
+        (``POST /v1/machines/{id}/network``).
+
+        ``allow`` is the WHOLE new list. A running machine changes in place; a
+        stopped one gets the policy at its next start.
+        """
+        body = {"network": network, "allow": list(allow or [])}
+        self._apply_machine(
+            self._client.request("POST", f"/v1/machines/{self.id}/network", body)
+        )
+        return self
+
+    def egress(self, action: str | None = None, limit: int | None = None) -> dict:
+        """Hosts this locked machine reached or was refused, newest first
+        (``GET /v1/machines/{id}/egress/activity``).
+
+        Returns ``{"activity": [{"host", "action", "at"}], "complete": bool}``.
+        ``complete`` is false when rows may be missing — always so for an open
+        or stopped machine. ``action`` filters to ``"allowed"`` or ``"blocked"``.
+        """
+        return self._client.request(
+            "GET", _qs(f"/v1/machines/{self.id}/egress/activity", action=action, limit=limit)
+        )
 
     def refresh(self) -> "Sandbox":
         """Re-read this machine (``GET /v1/machines/{id}``)."""
@@ -447,3 +504,46 @@ class Sandbox:
             self.close()
         except Exception:
             pass  # best-effort cleanup; never mask the original error
+
+
+class _Secrets:
+    """The secrets bound to a machine — by NAME; values are never readable.
+
+    ``sb.secrets.bind("STRIPE_KEY")`` makes the secret available to this
+    machine's next commands; ``unbind`` removes it. Secrets themselves are
+    created and rotated in the dashboard. Changes apply to the next command —
+    one already running keeps the environment it started with.
+    """
+
+    def __init__(self, sandbox: "Sandbox"):
+        self._sb = sandbox
+        self._names: list[str] = []
+
+    @property
+    def names(self) -> list[str]:
+        """Names bound to this machine, as last read from the API."""
+        return list(self._names)
+
+    def _set(self, bind: list[str], unbind: list[str]) -> list[str]:
+        rec = self._sb._client.request(
+            "POST", f"/v1/machines/{self._sb.id}/secrets", {"bind": bind, "unbind": unbind}
+        )
+        self._sb._apply_machine(rec)
+        return self.names
+
+    def bind(self, *names: str) -> list[str]:
+        """Bind secrets by name; returns the names now bound."""
+        return self._set(list(names), [])
+
+    def unbind(self, *names: str) -> list[str]:
+        """Unbind secrets by name; returns the names now bound."""
+        return self._set([], list(names))
+
+    def __iter__(self):
+        return iter(self._names)
+
+    def __len__(self) -> int:
+        return len(self._names)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"Secrets({self._names!r})"

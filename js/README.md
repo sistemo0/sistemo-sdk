@@ -245,7 +245,61 @@ HTTP 5xx/429, and not on a dropped connection. A dropped start is recovered by
 GET of the minted id (404 is retried for a few seconds — the API can 404 while
 still accepting the POST). If that GET also fails, `ExecStartUnconfirmed` carries it.
 
+## Locked network and secrets
+
+By default a machine has the open internet. `network: "locked"` refuses every
+outbound connection except HTTP and HTTPS (ports 80 and 443) to the hosts in
+`allow`. An entry is an exact host (`pypi.org`) or one leading `*.`
+(`*.pythonhosted.org`, which matches subdomains but not the name itself).
+A locked machine with an empty `allow` has no public outbound at all.
+
+```ts
+const sb = await Sandbox.create({ network: "locked", allow: ["pypi.org", "*.pythonhosted.org"] });
+await sb.run("pip install requests");               // allowed
+await sb.run("curl -sS https://example.com");       // refused
+
+await sb.setNetwork("locked", ["api.example.com"]); // replaces the WHOLE list
+[sb.network, sb.allow];                             // -> ["locked", ["api.example.com"]]
+
+const log = await sb.egress({ action: "blocked", limit: 50 }); // newest first
+for (const e of log.activity) console.log(e.at, e.action, e.host);
+log.complete; // false when rows may be missing; an empty list means
+              // "no outbound calls" only when this is true
+```
+
+A refused plain-HTTP call gets `403` with `{"code": "egress_domain_not_allowed"}`;
+a refused HTTPS call has its connection closed. A running machine changes
+policy in place; a stopped one gets it at its next start.
+
+**Secrets** are created and rotated in the dashboard; their values are
+write-only and no API call ever returns one. The SDK binds them by name, and
+each bound secret reaches the machine's commands as an environment variable of
+the same name:
+
+```ts
+const sb = await Sandbox.create({ secrets: ["ORDERS_DB_URL"] });
+await sb.run('psql "$ORDERS_DB_URL" -c "select 1"');
+
+await sb.secrets.bind("STRIPE_KEY");      // -> ["ORDERS_DB_URL", "STRIPE_KEY"]
+await sb.secrets.unbind("ORDERS_DB_URL"); // -> ["STRIPE_KEY"]
+sb.secrets.names;                         // names only
+
+await new Client().listSecrets();         // name, custody, hosts, bound_machines — never a value
+```
+
+⚠ A bound secret is readable by anything that runs on that machine — keep the
+machine's code and its network policy as tight as the secret is sensitive.
+Binding changes the NEXT command; one already running keeps its environment.
+At most 16 per machine. Passing `env` with the same name as a bound secret is
+a `400`, never a silent override. Every bind and unbind is in the Activity feed
+(names only).
+
 ## Changelog
+
+### 0.2.0
+
+- Locked networks: `Sandbox.create({ network: "locked", allow: [...] })`, `sb.setNetwork(network, allow)` and `sb.egress({ action, limit })`. `sb.network` and `sb.allow` are read back from every machine response. A create without these options sends exactly what 0.1.x sent, so the open default is unchanged.
+- Secrets by name: `Sandbox.create({ secrets: [...] })`, `sb.secrets.bind(...)` / `unbind(...)` / `names`, and `Client.listSecrets()`. Values are never returned.
 
 ### 0.1.8
 
