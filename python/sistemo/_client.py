@@ -391,6 +391,13 @@ class Client:
         """Delete a detached volume."""
         return self.request("DELETE", f"/v1/volumes/{volume_id}")
 
+    def list_secrets(self) -> list:
+        """The account's secrets — names, custody, hosts and how many machines
+        each is bound to (``GET /v1/secrets``). Never a value: values are
+        write-only, and secrets are created in the dashboard."""
+        rec = self.request("GET", "/v1/secrets")
+        return list((rec or {}).get("secrets") or [])
+
     def get_quotas(self) -> dict:
         """Account limits and current usage (``GET /v1/quotas``).
 

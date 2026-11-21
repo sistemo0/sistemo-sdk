@@ -465,7 +465,7 @@ class _MockAPI(BaseHTTPRequestHandler):
             self._send(200, {"snapshots": page, "next_cursor": None})
             return
 
-        if method == "GET" and path.startswith("/v1/machines/") and "/execs" not in path:
+        if method == "GET" and path.startswith("/v1/machines/") and "/execs" not in path and "/egress/" not in path:
             mid = path.split("/")[3]
             if len(parts) != 3:
                 self._send(404, {"detail": f"no mock for {method} {path}"})
@@ -483,6 +483,39 @@ class _MockAPI(BaseHTTPRequestHandler):
 
         if method == "POST" and path == "/v1/volumes":
             self._send(201, {"id": "v-new", "name": body.get("name"), "size_gb": body.get("size_gb")})
+            return
+
+        # Locked network + secrets (0.2.0).
+        if method == "POST" and path.endswith("/network"):
+            mid = path.split("/")[3]
+            m = _MockAPI.machines.get(mid)
+            if m is None:
+                self._send(404, {"detail": "not found", "code": "not_found"})
+                return
+            m["network"], m["allow"] = (body or {}).get("network"), (body or {}).get("allow")
+            self._send(200, m)
+            return
+        if method == "POST" and path.endswith("/secrets") and path.startswith("/v1/machines/"):
+            mid = path.split("/")[3]
+            m = _MockAPI.machines.get(mid)
+            if m is None:
+                self._send(404, {"detail": "not found", "code": "not_found"})
+                return
+            names = [n for n in (m.get("secrets") or []) if n not in (body or {}).get("unbind", [])]
+            for n in (body or {}).get("bind", []):
+                if n == "NOPE":
+                    self._send(400, {"detail": "no secret named NOPE", "code": "validation_error"})
+                    return
+                if n not in names:
+                    names.append(n)
+            m["secrets"] = sorted(names)
+            self._send(200, m)
+            return
+        if method == "GET" and path.endswith("/egress/activity"):
+            self._send(200, {"activity": [{"host": "evil.example", "action": "blocked", "at": "2026-11-21T12:00:00Z"}], "complete": True})
+            return
+        if method == "GET" and path == "/v1/secrets":
+            self._send(200, {"secrets": [{"name": "STRIPE_KEY", "custody": "box", "hosts": [], "bound_machines": 0}]})
             return
 
         self._send(404, {"detail": f"no mock for {method} {path}"})
@@ -1501,3 +1534,85 @@ class VersionDriftTest(unittest.TestCase):
             "the User-Agent must be derived from __version__, never restated — "
             "the WAF makes this string load-bearing and a stale one is invisible",
         )
+
+
+class LockedNetworkAndSecretsTest(unittest.TestCase):
+    """0.2.0: locked networks and secrets on Sandbox."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server, cls.base = _start_server()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        _MockAPI.log.clear()
+        _MockAPI.machines.clear()
+        _MockAPI.fail_next = None
+        _MockAPI.fail_queue = []
+        _MockAPI.idem_create.clear()
+        _MockAPI.drop_count = 0
+
+    def _sb(self, **kw) -> Sandbox:
+        return Sandbox(api_key="sk_test", base_url=self.base, **kw)
+
+    def _create_body(self) -> dict:
+        return [e for e in _MockAPI.log if e["method"] == "POST" and e["path"] == "/v1/machines"][-1]["body"]
+
+    def test_omitted_network_sends_nothing_so_the_default_stays_open(self) -> None:
+        # The open default belongs to the server: a create without these keys
+        # is exactly what 0.1.x sent.
+        sb = self._sb()
+        body = self._create_body()
+        for k in ("network", "allow", "secrets"):
+            self.assertNotIn(k, body)
+        self.assertEqual(sb.network, "open")
+
+    def test_locked_with_an_empty_allow_list_is_sent_as_an_empty_list(self) -> None:
+        sb = self._sb(network="locked", allow=[])
+        body = self._create_body()
+        self.assertEqual(body["network"], "locked")
+        self.assertEqual(body["allow"], [])  # [] = no outbound, not "unset"
+        self.assertEqual(sb.network, "locked")
+
+    def test_secrets_on_create_and_bind_unbind(self) -> None:
+        sb = self._sb(network="locked", allow=["api.example.com"], secrets=["STRIPE_KEY"])
+        self.assertEqual(self._create_body()["secrets"], ["STRIPE_KEY"])
+        self.assertEqual(sb.secrets.names, ["STRIPE_KEY"])
+        self.assertEqual(sb.secrets.bind("DB_URL"), ["DB_URL", "STRIPE_KEY"])
+        self.assertEqual(sb.secrets.unbind("STRIPE_KEY"), ["DB_URL"])
+        last = _MockAPI.log[-1]
+        self.assertEqual(last["path"], f"/v1/machines/{sb.id}/secrets")
+        self.assertEqual(last["body"], {"bind": [], "unbind": ["STRIPE_KEY"]})
+
+    def test_bind_of_an_unknown_name_is_an_api_error(self) -> None:
+        sb = self._sb()
+        with self.assertRaises(APIError) as cm:
+            sb.secrets.bind("NOPE")
+        self.assertEqual(cm.exception.status, 400)
+        self.assertEqual(sb.secrets.names, [])
+
+    def test_set_network_sends_the_whole_list(self) -> None:
+        sb = self._sb()
+        sb.set_network("locked", ["pypi.org", "files.pythonhosted.org"])
+        self.assertEqual(_MockAPI.log[-1]["body"], {"network": "locked", "allow": ["pypi.org", "files.pythonhosted.org"]})
+        self.assertEqual((sb.network, sb.allow), ("locked", ["pypi.org", "files.pythonhosted.org"]))
+
+    def test_egress_passes_its_filters(self) -> None:
+        sb = self._sb(network="locked", allow=[])
+        log = sb.egress(action="blocked", limit=10)
+        self.assertEqual(log["activity"][0]["host"], "evil.example")
+        self.assertEqual(_MockAPI.log[-1]["full_path"], f"/v1/machines/{sb.id}/egress/activity?action=blocked&limit=10")
+
+    def test_connect_reads_network_and_secrets(self) -> None:
+        sb = self._sb(network="locked", allow=["a.example.com"], secrets=["K"])
+        again = Sandbox.connect(sb.id, api_key="sk_test", base_url=self.base)
+        self.assertEqual((again.network, again.allow, again.secrets.names), ("locked", ["a.example.com"], ["K"]))
+
+    def test_list_secrets_returns_names_only(self) -> None:
+        c = Client(api_key="sk_test", base_url=self.base)
+        secrets = c.list_secrets()
+        self.assertEqual(secrets[0]["name"], "STRIPE_KEY")
+        self.assertNotIn("value", secrets[0])

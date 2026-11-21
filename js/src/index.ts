@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.1.8";
+const USER_AGENT = "@sistemo/sdk/0.2.0";
 
 /**
  * After a POST /execs whose ACK was lost, GET of the minted id retries 404
@@ -601,6 +601,15 @@ export class Client {
     return out.images ?? [];
   }
 
+  /**
+   * The account's secrets — names, custody, hosts, bound-machine counts
+   * (`GET /v1/secrets`). Never a value; secrets are created in the dashboard.
+   */
+  async listSecrets(): Promise<SecretInfo[]> {
+    const rec = await this.request<{ secrets?: SecretInfo[] | null }>("GET", "/v1/secrets");
+    return rec?.secrets ?? [];
+  }
+
   /** List the account's snapshots. Same paging contract as {@link listVolumes}. */
   async listSnapshots(opts?: { cursor?: string; limit?: number }): Promise<{
     snapshots: Snapshot[];
@@ -720,6 +729,73 @@ export interface SandboxOptions extends ClientOptions {
   rootVolumeId?: string;
   /** Optional fixed Idempotency-Key for create (default: random UUID). */
   idempotencyKey?: string;
+  /**
+   * `"locked"` limits outbound traffic to the hosts in {@link allow} (HTTP and
+   * HTTPS only; an empty list means no outbound access). Omit for the default
+   * open network.
+   */
+  network?: "open" | "locked";
+  /** Host names a locked machine may reach — exact, or with one leading `*.`. */
+  allow?: string[];
+  /** Secret names to bind; their values reach this machine's commands as env vars. */
+  secrets?: string[];
+}
+
+/** One row of a locked machine's egress log. */
+export interface EgressEvent {
+  host: string;
+  action: "allowed" | "blocked";
+  at: string;
+}
+
+/** A locked machine's egress log. `complete` is false when rows may be missing. */
+export interface EgressLog {
+  activity: EgressEvent[];
+  complete: boolean;
+}
+
+/** A stored secret as the API shows it — never a value. */
+export interface SecretInfo {
+  name: string;
+  custody: string;
+  hosts: string[];
+  /** Live (not destroyed) machines it is bound to. */
+  bound_machines: number;
+  created_at: string;
+  updated_at: string;
+}
+
+type MachineRecord = {
+  id?: string;
+  state?: string;
+  root_volume_id?: string;
+  network?: string;
+  allow?: string[];
+  secrets?: string[];
+};
+
+/**
+ * The secrets bound to a machine — by NAME; values are never readable.
+ * Changes apply to the machine's next command. Secrets are created and
+ * rotated in the dashboard.
+ */
+export class SandboxSecrets {
+  /** @internal */
+  names: string[] = [];
+  /** @internal */
+  constructor(private readonly set: (bind: string[], unbind: string[]) => Promise<void>) {}
+
+  /** Bind secrets by name; resolves to the names now bound. */
+  async bind(...names: string[]): Promise<string[]> {
+    await this.set(names, []);
+    return [...this.names];
+  }
+
+  /** Unbind secrets by name; resolves to the names now bound. */
+  async unbind(...names: string[]): Promise<string[]> {
+    await this.set([], names);
+    return [...this.names];
+  }
 }
 
 /** An isolated microVM you can run code in. Create with {@link Sandbox.create}. */
@@ -734,6 +810,12 @@ export class Sandbox {
    * here is the option passed to {@link create}, until a response names one.
    */
   rootVolumeId: string;
+  /** Outbound policy: `"open"` or `"locked"`. */
+  network = "open";
+  /** A locked machine's allow-list. */
+  allow: string[] = [];
+  /** Secrets bound to this machine (names). */
+  readonly secrets: SandboxSecrets;
   private readonly client: Client;
 
   private constructor(client: Client, id: string, state: string, rootVolumeId = "") {
@@ -741,6 +823,11 @@ export class Sandbox {
     this.id = id;
     this.state = state;
     this.rootVolumeId = rootVolumeId;
+    this.secrets = new SandboxSecrets(async (bind, unbind) => {
+      this.applyMachine(
+        await this.client.request<MachineRecord>("POST", `/v1/machines/${this.id}/secrets`, { bind, unbind }),
+      );
+    });
   }
 
   /** Provision a new microVM (resolves once it has booted). */
@@ -755,8 +842,13 @@ export class Sandbox {
       metadata: opts.metadata ?? {},
     };
     if (opts.rootVolumeId) body.root_volume_id = opts.rootVolumeId;
+    // ⚠ Sent only when given: a create without them is exactly what 0.1.x
+    // sent, so the open default stays the server's default.
+    if (opts.network !== undefined) body.network = opts.network;
+    if (opts.allow !== undefined) body.allow = [...opts.allow];
+    if (opts.secrets && opts.secrets.length) body.secrets = [...opts.secrets];
     const key = opts.idempotencyKey ?? newIdempotencyKey();
-    const machine = await client.request<{ id?: string; state?: string; root_volume_id?: string }>(
+    const machine = await client.request<MachineRecord>(
       "POST",
       "/v1/machines",
       body,
@@ -771,7 +863,9 @@ export class Sandbox {
     }
     // The option wins. The create response does not carry root_volume_id.
     const rootVolumeId = opts.rootVolumeId || machine.root_volume_id || "";
-    return new Sandbox(client, machine.id, machine.state ?? "", rootVolumeId);
+    const sb = new Sandbox(client, machine.id, machine.state ?? "", rootVolumeId);
+    sb.applyMachine(machine);
+    return sb;
   }
 
   /**
@@ -787,10 +881,7 @@ export class Sandbox {
       throw new SistemoError("machine id is required");
     }
     const client = opts.client ?? new Client(opts);
-    const machine = await client.request<{ id?: string; state?: string; root_volume_id?: string }>(
-      "GET",
-      `/v1/machines/${id}`,
-    );
+    const machine = await client.request<MachineRecord>("GET", `/v1/machines/${id}`);
     if (!machine?.id) {
       throw new APIError(
         502,
@@ -798,12 +889,14 @@ export class Sandbox {
         "invalid_machine_response",
       );
     }
-    return new Sandbox(
+    const sb = new Sandbox(
       client,
       machine.id,
       machine.state ?? "",
       machine.root_volume_id ? String(machine.root_volume_id) : "",
     );
+    sb.applyMachine(machine);
+    return sb;
   }
 
   /**
@@ -1005,10 +1098,44 @@ export class Sandbox {
     }
   }
 
-  private applyMachine(rec: { state?: string; root_volume_id?: string }): void {
+  private applyMachine(rec: MachineRecord): void {
     // ⚠ Omitting root_volume_id must not clear the one we already hold.
     if (rec?.state) this.state = String(rec.state);
     if (rec?.root_volume_id) this.rootVolumeId = String(rec.root_volume_id);
+    if (rec?.network) this.network = String(rec.network);
+    if (Array.isArray(rec?.allow)) this.allow = rec.allow.map(String);
+    if (Array.isArray(rec?.secrets)) this.secrets.names = rec.secrets.map(String);
+  }
+
+  /**
+   * Replace this machine's outbound policy (`POST /v1/machines/{id}/network`).
+   * `allow` is the WHOLE new list. A running machine changes in place; a
+   * stopped one gets it at its next start.
+   */
+  async setNetwork(network: "open" | "locked", allow: string[] = []): Promise<this> {
+    this.applyMachine(
+      await this.client.request<MachineRecord>("POST", `/v1/machines/${this.id}/network`, {
+        network,
+        allow: [...allow],
+      }),
+    );
+    return this;
+  }
+
+  /**
+   * Hosts this locked machine reached or was refused, newest first
+   * (`GET /v1/machines/{id}/egress/activity`). `complete` is false when rows
+   * may be missing — always so for an open or stopped machine.
+   */
+  async egress(opts: { action?: "allowed" | "blocked"; limit?: number } = {}): Promise<EgressLog> {
+    const q = new URLSearchParams();
+    if (opts.action) q.set("action", opts.action);
+    if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+    const qs = q.toString();
+    return this.client.request<EgressLog>(
+      "GET",
+      `/v1/machines/${this.id}/egress/activity${qs ? `?${qs}` : ""}`,
+    );
   }
 
   /** Re-read this machine (`GET /v1/machines/{id}`). */
