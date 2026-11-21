@@ -1476,6 +1476,39 @@ describe("locked network and secrets (0.2.0)", () => {
     assert.deepEqual(sb.secrets.names, []);
   });
 
+  it("a bare-string allow is a TypeError, and nothing is sent", async () => {
+    const sb = await mk();
+    const n = state.log.length;
+    await assert.rejects(sb.setNetwork("locked", "pypi.org"), TypeError);
+    await assert.rejects(Sandbox.create({ apiKey: "sk_test", baseUrl, network: "locked", allow: "pypi.org" }), TypeError);
+    assert.equal(state.log.length, n);
+  });
+
+  it("allow without locked is refused locally; open with no list is fine", async () => {
+    const sb = await mk();
+    const n = state.log.length;
+    await assert.rejects(sb.setNetwork("open", ["pypi.org"]), SistemoError);
+    await assert.rejects(Sandbox.create({ apiKey: "sk_test", baseUrl, allow: ["pypi.org"] }), SistemoError);
+    assert.equal(state.log.length, n);
+    await sb.setNetwork("open");
+    assert.equal(sb.network, "open");
+  });
+
+  it("setNetwork is retried on a 503 (a whole-list replace is safe to repeat)", async () => {
+    const sb = await mk();
+    state.failNext = { status: 503, body: { code: "unavailable", detail: "busy" } };
+    await sb.setNetwork("locked", ["pypi.org"]);
+    const posts = state.log.filter((e) => e.method === "POST" && e.path.endsWith("/network"));
+    assert.equal(posts.length, 2);
+    assert.deepEqual(sb.allow, ["pypi.org"]);
+  });
+
+  it("secrets.names is a copy — changing it changes nothing", async () => {
+    const sb = await mk({ secrets: ["K"] });
+    sb.secrets.names.push("FAKE");
+    assert.deepEqual(sb.secrets.names, ["K"]);
+  });
+
   it("setNetwork sends the whole list; egress passes its filters", async () => {
     const sb = await mk();
     await sb.setNetwork("locked", ["pypi.org", "files.pythonhosted.org"]);

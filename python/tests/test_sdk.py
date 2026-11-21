@@ -1600,6 +1600,34 @@ class LockedNetworkAndSecretsTest(unittest.TestCase):
         self.assertEqual(_MockAPI.log[-1]["body"], {"network": "locked", "allow": ["pypi.org", "files.pythonhosted.org"]})
         self.assertEqual((sb.network, sb.allow), ("locked", ["pypi.org", "files.pythonhosted.org"]))
 
+    def test_a_bare_string_allow_is_a_type_error_not_characters(self) -> None:
+        sb = self._sb()
+        n = len(_MockAPI.log)
+        with self.assertRaises(TypeError):
+            sb.set_network("locked", "pypi.org")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            Sandbox(api_key="sk_test", base_url=self.base, network="locked", allow="pypi.org")  # type: ignore[arg-type]
+        self.assertEqual(len(_MockAPI.log), n, "nothing may be sent")
+
+    def test_allow_without_locked_is_refused_locally(self) -> None:
+        sb = self._sb()
+        n = len(_MockAPI.log)
+        with self.assertRaises(ValueError):
+            sb.set_network("open", ["pypi.org"])
+        with self.assertRaises(ValueError):
+            Sandbox(api_key="sk_test", base_url=self.base, allow=["pypi.org"])
+        self.assertEqual(len(_MockAPI.log), n, "nothing may be sent")
+        sb.set_network("open")  # counter-guard: open with no allow is fine
+        self.assertEqual(sb.network, "open")
+
+    def test_set_network_is_retried_on_a_503(self) -> None:
+        sb = self._sb()
+        _MockAPI.fail_next = {"status": 503, "body": {"code": "unavailable", "detail": "busy"}}
+        sb.set_network("locked", ["pypi.org"])
+        posts = [e for e in _MockAPI.log if e["method"] == "POST" and e["path"].endswith("/network")]
+        self.assertEqual(len(posts), 2, "a whole-list replace is safe to retry")
+        self.assertEqual(sb.allow, ["pypi.org"])
+
     def test_egress_passes_its_filters(self) -> None:
         sb = self._sb(network="locked", allow=[])
         log = sb.egress(action="blocked", limit=10)

@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.2.0";
+const USER_AGENT = "@sistemo/sdk/0.2.1";
 
 /**
  * After a POST /execs whose ACK was lost, GET of the minted id retries 404
@@ -737,7 +737,16 @@ export interface SandboxOptions extends ClientOptions {
   network?: "open" | "locked";
   /** Host names a locked machine may reach — exact, or with one leading `*.`. */
   allow?: string[];
-  /** Secret names to bind; their values reach this machine's commands as env vars. */
+  /**
+   * Secret names to bind; each becomes an env var of that name in this
+   * machine's commands. A **box** secret's variable holds the value (code on
+   * the machine can read it). A **proxy** secret's holds a `sist_ph_…`
+   * placeholder — the value is added only on HTTPS to the secret's hosts, so it
+   * needs `network: "locked"` with those hosts in `allow`. On such a machine do
+   * not set SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE or
+   * NODE_EXTRA_CA_CERTS in a command's env: the server sets them so HTTPS
+   * clients trust the machine's own CA.
+   */
   secrets?: string[];
 }
 
@@ -757,8 +766,14 @@ export interface EgressLog {
 /** A stored secret as the API shows it — never a value. */
 export interface SecretInfo {
   name: string;
-  custody: string;
+  custody: "box" | "proxy" | string;
   hosts: string[];
+  /** Proxy only: where the request carries the placeholder — bearer, basic, header:<Name> or query:<param>. */
+  presentation?: string;
+  /** Proxy only: the value is added only for this HTTP method. */
+  method?: string;
+  /** Proxy only: the value is added only for paths at or below this one. */
+  path_prefix?: string;
   /** Live (not destroyed) machines it is bound to. */
   bound_machines: number;
   created_at: string;
@@ -781,20 +796,35 @@ type MachineRecord = {
  */
 export class SandboxSecrets {
   /** @internal */
-  names: string[] = [];
+  _names: string[] = [];
+  /** The bound names, as last read from the API (a copy — changing it changes nothing). */
+  get names(): string[] {
+    return [...this._names];
+  }
   /** @internal */
   constructor(private readonly set: (bind: string[], unbind: string[]) => Promise<void>) {}
 
   /** Bind secrets by name; resolves to the names now bound. */
   async bind(...names: string[]): Promise<string[]> {
     await this.set(names, []);
-    return [...this.names];
+    return this.names;
   }
 
   /** Unbind secrets by name; resolves to the names now bound. */
   async unbind(...names: string[]): Promise<string[]> {
     await this.set([], names);
-    return [...this.names];
+    return this.names;
+  }
+}
+
+/** Refuse locally what the API would refuse, before anything is sent. */
+function checkNetworkArgs(network: string | undefined, allow: unknown): void {
+  if (typeof allow === "string") {
+    // A bare string would be spread into single characters.
+    throw new TypeError('allow must be an array of host names, e.g. ["pypi.org"]');
+  }
+  if (Array.isArray(allow) && allow.length > 0 && network !== "locked") {
+    throw new SistemoError('allow only applies when network is "locked"');
   }
 }
 
@@ -842,6 +872,7 @@ export class Sandbox {
       metadata: opts.metadata ?? {},
     };
     if (opts.rootVolumeId) body.root_volume_id = opts.rootVolumeId;
+    checkNetworkArgs(opts.network, opts.allow);
     // ⚠ Sent only when given: a create without them is exactly what 0.1.x
     // sent, so the open default stays the server's default.
     if (opts.network !== undefined) body.network = opts.network;
@@ -1104,20 +1135,31 @@ export class Sandbox {
     if (rec?.root_volume_id) this.rootVolumeId = String(rec.root_volume_id);
     if (rec?.network) this.network = String(rec.network);
     if (Array.isArray(rec?.allow)) this.allow = rec.allow.map(String);
-    if (Array.isArray(rec?.secrets)) this.secrets.names = rec.secrets.map(String);
+    if (Array.isArray(rec?.secrets)) this.secrets._names = rec.secrets.map(String);
   }
 
   /**
    * Replace this machine's outbound policy (`POST /v1/machines/{id}/network`).
-   * `allow` is the WHOLE new list. A running machine changes in place; a
-   * stopped one gets it at its next start.
+   * `allow` is the WHOLE new list — `setNetwork("locked")` with no list leaves
+   * no outbound access at all. A running machine changes in place; a stopped
+   * one gets it at its next start.
+   *
+   * A full replace, so it is retried on a dropped connection or a 5xx/429. If
+   * it still fails, `sb.network` / `sb.allow` keep the OLD policy even though
+   * the host may already have the new one (503 "secrets could not be
+   * delivered", 409 "changed state"): send the same call again — it converges.
    */
   async setNetwork(network: "open" | "locked", allow: string[] = []): Promise<this> {
+    checkNetworkArgs(network, allow);
+    // ⚠ An Idempotency-Key only so the client may retry: the server ignores it
+    // on this route, and re-sending a whole-list replace is harmless.
     this.applyMachine(
-      await this.client.request<MachineRecord>("POST", `/v1/machines/${this.id}/network`, {
-        network,
-        allow: [...allow],
-      }),
+      await this.client.request<MachineRecord>(
+        "POST",
+        `/v1/machines/${this.id}/network`,
+        { network, allow: [...allow] },
+        { idempotencyKey: newIdempotencyKey() },
+      ),
     );
     return this;
   }
