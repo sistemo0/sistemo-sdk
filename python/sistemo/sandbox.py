@@ -12,6 +12,7 @@ from .errors import (
     APIError,
     ExecStartUnconfirmed,
     MachineTimeout,
+    InvalidArgumentError,
     NotFoundError,
     SistemoError,
 )
@@ -532,12 +533,12 @@ class Sandbox:
 def _check_network_args(network: str | None, allow) -> None:
     """Refuse locally what the API would refuse, before anything is sent."""
     if network is not None and network not in ("open", "locked"):
-        raise ValueError(f'network must be "open" or "locked" (got {network!r})')
+        raise InvalidArgumentError(f'network must be "open" or "locked" (got {network!r})')
     if isinstance(allow, str):
         # A bare string would be iterated into single characters.
         raise TypeError("allow must be a list of host names, e.g. [\"pypi.org\"]")
     if allow and network != "locked":
-        raise ValueError('allow only applies when network="locked"')
+        raise InvalidArgumentError('allow only applies when network="locked"')
 
 
 class _Secrets:

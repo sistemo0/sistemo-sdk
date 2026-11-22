@@ -1631,6 +1631,27 @@ class LockedNetworkAndSecretsTest(unittest.TestCase):
         sb.set_network("open")  # counter-guard: open with no allow is fine
         self.assertEqual(sb.network, "open")
 
+    def test_a_long_idempotency_key_is_refused_before_sending(self) -> None:
+        from sistemo import InvalidArgumentError, SistemoError
+
+        n = len(_MockAPI.log)
+        for bad in ("a" * 256, "has space", "x" * 20000):
+            with self.assertRaises(InvalidArgumentError) as cm:
+                Sandbox(api_key="sk_test", base_url=self.base, idempotency_key=bad)
+            self.assertIsInstance(cm.exception, SistemoError)
+            self.assertIsInstance(cm.exception, ValueError)
+        self.assertEqual(len(_MockAPI.log), n, "nothing may be sent — a 20 KB key would be a retried CDN 520")
+        self._sb(idempotency_key="a" * 255)  # the limit itself is fine
+
+    def test_client_side_refusals_are_sistemo_errors_and_value_errors(self) -> None:
+        from sistemo import InvalidArgumentError, SistemoError
+
+        sb = self._sb()
+        with self.assertRaises(InvalidArgumentError) as cm:
+            sb.set_network("closed")
+        self.assertIsInstance(cm.exception, SistemoError)
+        self.assertIsInstance(cm.exception, ValueError)
+
     def test_an_unknown_network_value_says_so(self) -> None:
         sb = self._sb()
         n = len(_MockAPI.log)

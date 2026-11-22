@@ -34,6 +34,7 @@ from .errors import (
     ProcessLimitError,
     QuotaExceededError,
     RateLimitError,
+    InvalidArgumentError,
     SistemoError,
     TooManyExecsError,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "Client",
     "Page",
     "SistemoError",
+    "InvalidArgumentError",
     "APIError",
     "AuthError",
     "QuotaExceededError",

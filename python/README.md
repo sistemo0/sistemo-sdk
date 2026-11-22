@@ -304,6 +304,11 @@ a `400`, never a silent override. Every bind and unbind is in the Activity feed
 
 ## Changelog
 
+### 0.2.3
+
+- An `idempotency_key` longer than 255 printable ASCII characters is refused before anything is sent (`InvalidArgumentError` (a `SistemoError` and a `ValueError`)). A long one was refused by proxies first — HTML at 8 KiB, and a CDN 520 past ~16 KiB that the client retried.
+- Client-side refusals (a bad `network`, `allow` without `"locked"`, a bad key) raise `InvalidArgumentError`, which is also a `ValueError` as before — so they are catchable as `SistemoError`, like the JS SDK.
+
 ### 0.2.2
 
 - A 429's `Retry-After` is spread over up to half as long again, so many callers refused at once (parallel creates) do not all retry in the same instant.

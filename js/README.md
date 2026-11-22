@@ -312,6 +312,10 @@ a `400`, never a silent override. Every bind and unbind is in the Activity feed
 
 ## Changelog
 
+### 0.2.3
+
+- An `idempotencyKey` longer than 255 printable ASCII characters is refused before anything is sent (`SistemoError`). A long one was refused by proxies first — HTML at 8 KiB, and a CDN 520 past ~16 KiB that the client retried.
+
 ### 0.2.2
 
 - A 429's `Retry-After` is spread over up to half as long again, so many callers refused at once (parallel creates) do not all retry in the same instant.
