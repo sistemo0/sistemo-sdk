@@ -829,6 +829,17 @@ class SDKTest(unittest.TestCase):
         self.assertGreaterEqual(d, 12)
         self.assertLessEqual(d, 60)
 
+    def test_retry_after_is_spread_so_refused_callers_do_not_return_together(self) -> None:
+        from sistemo._client import retry_delay
+        from sistemo.errors import RateLimitError
+
+        err = RateLimitError(429, "slow", "rate_limited", retry_after=2)
+        lo = retry_delay(0, 0.01, 8.0, err, rng=lambda: 0.0)
+        hi = retry_delay(0, 0.01, 8.0, err, rng=lambda: 0.999)
+        self.assertGreaterEqual(lo, 2)
+        self.assertGreater(hi - lo, 0.9, "callers told the same Retry-After must not all wait the same time")
+        self.assertLessEqual(hi, 3.0)
+
     def test_retry_after_cap_is_60(self) -> None:
         from sistemo._client import parse_retry_after
 
@@ -1619,6 +1630,15 @@ class LockedNetworkAndSecretsTest(unittest.TestCase):
         self.assertEqual(len(_MockAPI.log), n, "nothing may be sent")
         sb.set_network("open")  # counter-guard: open with no allow is fine
         self.assertEqual(sb.network, "open")
+
+    def test_an_unknown_network_value_says_so(self) -> None:
+        sb = self._sb()
+        n = len(_MockAPI.log)
+        for bad in ("closed", "LOCKED"):
+            with self.assertRaises(ValueError) as cm:
+                sb.set_network(bad, ["pypi.org"])
+            self.assertIn('network must be "open" or "locked"', str(cm.exception))
+        self.assertEqual(len(_MockAPI.log), n, "nothing may be sent")
 
     def test_set_network_is_retried_on_a_503(self) -> None:
         sb = self._sb()
