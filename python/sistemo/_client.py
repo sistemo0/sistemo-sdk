@@ -65,7 +65,12 @@ def retry_delay(
         if err.retry_after is None:
             delay = max(delay, min(max_backoff, base))
         else:
-            delay = min(max(delay, err.retry_after), _RETRY_AFTER_CAP)
+            # Spread clients over up to half as long again as Retry-After: every
+            # caller refused by the same limit is told the same number, and
+            # waiting exactly that long brings them all back in the same instant
+            # (audit Z5 — 3 of 20 parallel creates gave up that way).
+            spread = err.retry_after * (1 + 0.5 * rng())
+            delay = min(max(delay, spread), _RETRY_AFTER_CAP)
     return delay
 
 DEFAULT_BASE_URL = "https://api.sistemo.io"

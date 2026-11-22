@@ -988,6 +988,15 @@ describe("request id and Retry-After", () => {
     assert.ok(d <= 60_000, `delay ${d} must cap at 60s`);
   });
 
+  it("Retry-After is spread so refused callers do not return together", () => {
+    const err = new RateLimitError(429, "slow", "rate_limited", {}, { retryAfter: 2 });
+    const lo = retryDelayMs(0, 10, 8000, err, () => 0);
+    const hi = retryDelayMs(0, 10, 8000, err, () => 0.999);
+    assert.ok(lo >= 2000, `lo ${lo}`);
+    assert.ok(hi - lo > 900, `spread ${hi - lo} too small`);
+    assert.ok(hi <= 3000, `hi ${hi}`);
+  });
+
   it("parseRetryAfter caps at 60 and rejects junk", () => {
     assert.equal(parseRetryAfter("999"), 60);
     assert.equal(parseRetryAfter("12"), 12);
@@ -1492,6 +1501,15 @@ describe("locked network and secrets (0.2.0)", () => {
     assert.equal(state.log.length, n);
     await sb.setNetwork("open");
     assert.equal(sb.network, "open");
+  });
+
+  it("an unknown network value says so, and nothing is sent", async () => {
+    const sb = await mk();
+    const n = state.log.length;
+    for (const bad of ["closed", "LOCKED"]) {
+      await assert.rejects(sb.setNetwork(bad, ["pypi.org"]), /network must be "open" or "locked"/);
+    }
+    assert.equal(state.log.length, n);
   });
 
   it("setNetwork is retried on a 503 (a whole-list replace is safe to repeat)", async () => {

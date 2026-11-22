@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.2.1";
+const USER_AGENT = "@sistemo/sdk/0.2.2";
 
 /**
  * After a POST /execs whose ACK was lost, GET of the minted id retries 404
@@ -289,7 +289,10 @@ export function retryDelayMs(
     if (err.retryAfter == null) {
       delay = Math.max(delay, base);
     } else {
-      delay = Math.min(Math.max(delay, err.retryAfter * 1000), RETRY_AFTER_CAP_SEC * 1000);
+      // Spread over up to half as long again as Retry-After, so callers refused
+      // by the same limit do not all return in the same instant (audit Z5).
+      const spread = err.retryAfter * 1000 * (1 + 0.5 * rand());
+      delay = Math.min(Math.max(delay, spread), RETRY_AFTER_CAP_SEC * 1000);
     }
   }
   return delay;
@@ -819,6 +822,9 @@ export class SandboxSecrets {
 
 /** Refuse locally what the API would refuse, before anything is sent. */
 function checkNetworkArgs(network: string | undefined, allow: unknown): void {
+  if (network !== undefined && network !== "open" && network !== "locked") {
+    throw new SistemoError(`network must be "open" or "locked" (got ${JSON.stringify(network)})`);
+  }
   if (typeof allow === "string") {
     // A bare string would be spread into single characters.
     throw new TypeError('allow must be an array of host names, e.g. ["pypi.org"]');

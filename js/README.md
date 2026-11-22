@@ -312,6 +312,11 @@ a `400`, never a silent override. Every bind and unbind is in the Activity feed
 
 ## Changelog
 
+### 0.2.2
+
+- A 429's `Retry-After` is spread over up to half as long again, so many callers refused at once (parallel creates) do not all retry in the same instant.
+- `setNetwork` / create refuse a `network` other than `"open"` or `"locked"` with that message, before anything is sent.
+
 ### 0.2.1
 
 - `setNetwork` is retried on a dropped connection or a 5xx/429 (a full replace is safe to repeat).
