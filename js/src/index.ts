@@ -718,6 +718,12 @@ export interface ExecResult {
    * genuinely exited -1.
    */
   lost?: boolean;
+  /**
+   * The machine ran out of memory and the kernel killed this command (or
+   * something it started) — usually exit code 137. Give it more memory, or make
+   * it use less; re-running as-is will likely hit the same wall.
+   */
+  oomKilled?: boolean;
 }
 
 export interface SandboxOptions extends ClientOptions {
@@ -999,6 +1005,7 @@ export class Sandbox {
       truncated: job.truncated,
       requestId: job.requestId,
       lost,
+      oomKilled: job.oomKilled,
       ok: exitCode === 0 && !lost,
     };
   }
@@ -1319,6 +1326,7 @@ interface JobRecord {
   stdout_bytes?: number;
   stderr_bytes?: number;
   truncated?: boolean;
+  oom_killed?: boolean;
   started_at?: string | null;
   finished_at?: string | null;
 }
@@ -1350,6 +1358,8 @@ export class Job {
   stdoutBytes = 0;
   stderrBytes = 0;
   truncated = false;
+  /** The machine ran out of memory and the kernel killed this command (usually exit 137). */
+  oomKilled = false;
   startedAt: string | null = null;
   finishedAt: string | null = null;
 
@@ -1370,6 +1380,7 @@ export class Job {
     this.stdoutBytes = rec.stdout_bytes ?? 0;
     this.stderrBytes = rec.stderr_bytes ?? 0;
     this.truncated = rec.truncated ?? false;
+    this.oomKilled = rec.oom_killed ?? false;
     this.startedAt = rec.started_at ?? null;
     this.finishedAt = rec.finished_at ?? null;
     return this;

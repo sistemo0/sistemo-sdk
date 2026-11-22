@@ -306,6 +306,7 @@ a `400`, never a silent override. Every bind and unbind is in the Activity feed
 
 ### 0.2.3
 
+- `ExecResult.oom_killed` and `Job.oom_killed`: true when the machine ran out of memory and the kernel killed the command (usually exit code 137). The API has reported it; the SDK dropped it.
 - An `idempotency_key` longer than 255 printable ASCII characters is refused before anything is sent (`InvalidArgumentError` (a `SistemoError` and a `ValueError`)). A long one was refused by proxies first — HTML at 8 KiB, and a CDN 520 past ~16 KiB that the client retried.
 - Client-side refusals (a bad `network`, `allow` without `"locked"`, a bad key) raise `InvalidArgumentError`, which is also a `ValueError` as before — so they are catchable as `SistemoError`, like the JS SDK.
 

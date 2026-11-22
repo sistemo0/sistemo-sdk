@@ -62,6 +62,10 @@ class ExecResult:
     #: Without this flag a machine that died mid-command was indistinguishable
     #: from a command that genuinely exited -1.
     lost: bool = False
+    #: The machine ran out of memory and the kernel killed this command (or
+    #: something it started) — usually exit code 137. Give it more memory, or
+    #: make it use less; re-running as-is will likely hit the same wall.
+    oom_killed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -244,6 +248,7 @@ class Sandbox:
             truncated=job.truncated,
             request_id=job.request_id,
             lost=job.lost,
+            oom_killed=job.oom_killed,
         )
 
     def start(
