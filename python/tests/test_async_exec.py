@@ -166,6 +166,17 @@ class AsyncExecTest(unittest.TestCase):
         self.assertEqual(r.exit_code, -1)
         self.assertFalse(r.ok)
 
+    def test_oom_killed_reaches_the_job_and_run(self):
+        """The API says why a command died of memory; both surfaces must carry it."""
+        SCENE["job"] = job_rec("failed", 137, oom_killed=True)
+        SCENE["pages"] = [page(0, b"", eof=True)]
+        self.assertTrue(Job(self.sandbox(), SCENE["job"]).oom_killed)
+        r = self.sandbox().run("whatever")
+        self.assertTrue(r.oom_killed)
+        self.assertEqual(r.exit_code, 137)
+        SCENE["job"] = job_rec("failed", 137)
+        self.assertFalse(self.sandbox().run("whatever").oom_killed, "a plain 137 is not an OOM kill")
+
     def test_failed_job_is_done_but_not_ok(self):
         j = Job(self.sandbox(), job_rec("failed", 7))
         self.assertTrue(j.done)

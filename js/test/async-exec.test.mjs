@@ -130,6 +130,18 @@ describe("the exit-code contract", () => {
     assert.equal(r.exitCode, -1);
   });
 
+  it("oom_killed reaches the job and run()", async () => {
+    scene.job = jobRec("failed", 137, { oom_killed: true });
+    scene.pages = [page(0, Buffer.alloc(0), true)];
+    const sb = await newSandbox();
+    assert.equal((await sb.job("x")).oomKilled, true);
+    const r = await sb.run("whatever");
+    assert.equal(r.oomKilled, true);
+    assert.equal(r.exitCode, 137);
+    scene.job = jobRec("failed", 137);
+    assert.equal((await sb.run("whatever")).oomKilled, false, "a plain 137 is not an OOM kill");
+  });
+
   it("a failed job is done but not ok", async () => {
     scene.job = jobRec("failed", 7);
     const sb = await newSandbox();

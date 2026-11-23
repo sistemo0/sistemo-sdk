@@ -66,6 +66,9 @@ class Job:
         self.stdout_bytes: int = int(rec.get("stdout_bytes") or 0)
         self.stderr_bytes: int = int(rec.get("stderr_bytes") or 0)
         self.truncated: bool = bool(rec.get("truncated"))
+        #: The machine ran out of memory and the kernel killed this command (or
+        #: something it started). It usually exits 137; this says why.
+        self.oom_killed: bool = bool(rec.get("oom_killed"))
         self.started_at = rec.get("started_at")
         self.finished_at = rec.get("finished_at")
         return self

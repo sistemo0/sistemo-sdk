@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.2.2";
+const USER_AGENT = "@sistemo/sdk/0.2.3";
 
 /**
  * After a POST /execs whose ACK was lost, GET of the minted id retries 404
@@ -352,6 +352,7 @@ export class Client {
     body?: unknown,
     opts: RequestOptions = {},
   ): Promise<T> {
+    checkIdempotencyKey(opts.idempotencyKey);
     const retries = opts.maxRetries ?? this.maxRetries;
     const methodU = method.toUpperCase();
     let lastErr: unknown;
@@ -717,6 +718,12 @@ export interface ExecResult {
    * genuinely exited -1.
    */
   lost?: boolean;
+  /**
+   * The machine ran out of memory and the kernel killed this command (or
+   * something it started) — usually exit code 137. Give it more memory, or make
+   * it use less; re-running as-is will likely hit the same wall.
+   */
+  oomKilled?: boolean;
 }
 
 export interface SandboxOptions extends ClientOptions {
@@ -817,6 +824,20 @@ export class SandboxSecrets {
   async unbind(...names: string[]): Promise<string[]> {
     await this.set([], names);
     return this.names;
+  }
+}
+
+// The API refuses an Idempotency-Key over 255 printable ASCII characters. A longer
+// one never reaches it: proxies answer an HTML 400 from 8 KiB and a CDN 520 from
+// ~16 KiB — a 5xx this client would RETRY although it can never succeed.
+const MAX_IDEMPOTENCY_KEY_LEN = 255;
+
+function checkIdempotencyKey(key: string | undefined): void {
+  if (key === undefined) return;
+  if (key.length > MAX_IDEMPOTENCY_KEY_LEN || !/^[!-~]+$/.test(key)) {
+    throw new SistemoError(
+      `idempotencyKey must be 1-${MAX_IDEMPOTENCY_KEY_LEN} printable ASCII characters with no spaces (got ${key.length}) — a UUID is ideal`,
+    );
   }
 }
 
@@ -984,6 +1005,7 @@ export class Sandbox {
       truncated: job.truncated,
       requestId: job.requestId,
       lost,
+      oomKilled: job.oomKilled,
       ok: exitCode === 0 && !lost,
     };
   }
@@ -1304,6 +1326,7 @@ interface JobRecord {
   stdout_bytes?: number;
   stderr_bytes?: number;
   truncated?: boolean;
+  oom_killed?: boolean;
   started_at?: string | null;
   finished_at?: string | null;
 }
@@ -1335,6 +1358,8 @@ export class Job {
   stdoutBytes = 0;
   stderrBytes = 0;
   truncated = false;
+  /** The machine ran out of memory and the kernel killed this command (usually exit 137). */
+  oomKilled = false;
   startedAt: string | null = null;
   finishedAt: string | null = null;
 
@@ -1355,6 +1380,7 @@ export class Job {
     this.stdoutBytes = rec.stdout_bytes ?? 0;
     this.stderrBytes = rec.stderr_bytes ?? 0;
     this.truncated = rec.truncated ?? false;
+    this.oomKilled = rec.oom_killed ?? false;
     this.startedAt = rec.started_at ?? null;
     this.finishedAt = rec.finished_at ?? null;
     return this;

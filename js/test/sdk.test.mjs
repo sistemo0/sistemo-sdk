@@ -1503,6 +1503,18 @@ describe("locked network and secrets (0.2.0)", () => {
     assert.equal(sb.network, "open");
   });
 
+  it("a long Idempotency-Key is refused before anything is sent", async () => {
+    const n = state.log.length;
+    for (const bad of ["a".repeat(256), "has space", "x".repeat(20000)]) {
+      await assert.rejects(
+        Sandbox.create({ apiKey: "sk_test", baseUrl, idempotencyKey: bad }),
+        (e) => e instanceof SistemoError && /idempotencyKey must be/.test(e.message),
+      );
+    }
+    assert.equal(state.log.length, n);
+    await mk({ idempotencyKey: "a".repeat(255) }); // the limit itself is fine
+  });
+
   it("an unknown network value says so, and nothing is sent", async () => {
     const sb = await mk();
     const n = state.log.length;

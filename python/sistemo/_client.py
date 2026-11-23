@@ -17,7 +17,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Iterator, Mapping
 
 from ._version import __version__
-from .errors import APIError, SistemoError, api_error
+from .errors import APIError, InvalidArgumentError, SistemoError, api_error
 
 # Honour Retry-After, but never sleep more than a minute on a single retry.
 _RETRY_AFTER_CAP = 60.0
@@ -184,6 +184,7 @@ class Client:
         """
         retries = self.max_retries if max_retries is None else max(0, max_retries)
         method_u = method.upper()
+        _check_idempotency_key(idempotency_key)
         last_err: BaseException | None = None
         hdrs = dict(headers or {})
         req_id = None
@@ -438,3 +439,20 @@ class Client:
     def delete_snapshot(self, snapshot_id: str) -> dict:
         """Delete a snapshot (``DELETE /v1/snapshots/{id}``)."""
         return self.request("DELETE", f"/v1/snapshots/{snapshot_id}")
+
+
+# The API refuses an Idempotency-Key over 255 printable ASCII characters. A
+# longer one never even reaches it: proxies answer an HTML 400 from 8 KiB and a
+# CDN 520 from ~16 KiB — a 5xx this client would RETRY although it can never
+# succeed. So it is refused here, before anything is sent.
+MAX_IDEMPOTENCY_KEY_LEN = 255
+
+
+def _check_idempotency_key(key: str | None) -> None:
+    if key is None:
+        return
+    if len(key) > MAX_IDEMPOTENCY_KEY_LEN or not all(0x21 <= ord(c) <= 0x7E for c in key):
+        raise InvalidArgumentError(
+            f"idempotency_key must be 1-{MAX_IDEMPOTENCY_KEY_LEN} printable ASCII characters "
+            f"with no spaces (got {len(key)}) — a UUID is ideal"
+        )

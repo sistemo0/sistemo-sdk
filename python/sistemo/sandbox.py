@@ -12,6 +12,7 @@ from .errors import (
     APIError,
     ExecStartUnconfirmed,
     MachineTimeout,
+    InvalidArgumentError,
     NotFoundError,
     SistemoError,
 )
@@ -61,6 +62,10 @@ class ExecResult:
     #: Without this flag a machine that died mid-command was indistinguishable
     #: from a command that genuinely exited -1.
     lost: bool = False
+    #: The machine ran out of memory and the kernel killed this command (or
+    #: something it started) — usually exit code 137. Give it more memory, or
+    #: make it use less; re-running as-is will likely hit the same wall.
+    oom_killed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -243,6 +248,7 @@ class Sandbox:
             truncated=job.truncated,
             request_id=job.request_id,
             lost=job.lost,
+            oom_killed=job.oom_killed,
         )
 
     def start(
@@ -532,12 +538,12 @@ class Sandbox:
 def _check_network_args(network: str | None, allow) -> None:
     """Refuse locally what the API would refuse, before anything is sent."""
     if network is not None and network not in ("open", "locked"):
-        raise ValueError(f'network must be "open" or "locked" (got {network!r})')
+        raise InvalidArgumentError(f'network must be "open" or "locked" (got {network!r})')
     if isinstance(allow, str):
         # A bare string would be iterated into single characters.
         raise TypeError("allow must be a list of host names, e.g. [\"pypi.org\"]")
     if allow and network != "locked":
-        raise ValueError('allow only applies when network="locked"')
+        raise InvalidArgumentError('allow only applies when network="locked"')
 
 
 class _Secrets:

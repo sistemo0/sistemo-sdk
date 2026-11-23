@@ -7,6 +7,15 @@ class SistemoError(Exception):
     """Base class for every error raised by this SDK."""
 
 
+class InvalidArgumentError(SistemoError, ValueError):
+    """A value the SDK refuses before sending anything (the API would refuse it).
+
+    It is a ``SistemoError`` like everything else this SDK raises — the JS SDK
+    throws ``SistemoError`` for the same cases — and also a ``ValueError``, so
+    code written against 0.2.1/0.2.2's plain ``ValueError`` keeps working.
+    """
+
+
 class APIError(SistemoError):
     """The API returned a non-2xx response."""
 
