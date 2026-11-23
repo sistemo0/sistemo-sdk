@@ -451,7 +451,10 @@ MAX_IDEMPOTENCY_KEY_LEN = 255
 def _check_idempotency_key(key: str | None) -> None:
     if key is None:
         return
-    if len(key) > MAX_IDEMPOTENCY_KEY_LEN or not all(0x21 <= ord(c) <= 0x7E for c in key):
+    # ⚠ "" used to pass this check and then be dropped (the header is only sent
+    # for a non-empty key), so a caller who meant to make a create retry-safe
+    # silently was not. The JS SDK already refused it.
+    if len(key) == 0 or len(key) > MAX_IDEMPOTENCY_KEY_LEN or not all(0x21 <= ord(c) <= 0x7E for c in key):
         raise InvalidArgumentError(
             f"idempotency_key must be 1-{MAX_IDEMPOTENCY_KEY_LEN} printable ASCII characters "
             f"with no spaces (got {len(key)}) — a UUID is ideal"

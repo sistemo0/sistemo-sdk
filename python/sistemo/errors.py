@@ -16,6 +16,15 @@ class InvalidArgumentError(SistemoError, ValueError):
     """
 
 
+class _InvalidArgumentTypeError(InvalidArgumentError, TypeError):
+    """An argument of the wrong TYPE (``allow="pypi.org"`` instead of a list).
+
+    Catch it as :class:`InvalidArgumentError` / :class:`SistemoError` like every
+    other local refusal; it is also a ``TypeError``, which is what 0.2.1–0.2.3
+    raised for it, so existing ``except TypeError`` code keeps working.
+    """
+
+
 class APIError(SistemoError):
     """The API returned a non-2xx response."""
 

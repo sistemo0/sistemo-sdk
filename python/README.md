@@ -304,6 +304,12 @@ a `400`, never a silent override. Every bind and unbind is in the Activity feed
 
 ## Changelog
 
+### 0.2.4
+
+- `Sandbox.close()` keeps trying until the machine is deleted — through rate limits (honouring `Retry-After`), dropped connections and a machine still mid-transition — for up to `timeout` seconds (default `CLOSE_TIMEOUT`, 120), whatever `max_retries` says. A machine already gone counts as closed. Tearing many machines down at once no longer leaves some running and billed.
+- A `with Sandbox()` block that could not delete its machine now emits a `RuntimeWarning` naming it, instead of failing silently.
+- `idempotency_key=""` is refused (it was silently dropped), and `allow="pypi.org"` raises `InvalidArgumentError` (still a `TypeError` too).
+
 ### 0.2.3
 
 - `ExecResult.oom_killed` and `Job.oom_killed`: true when the machine ran out of memory and the kernel killed the command (usually exit code 137). The API has reported it; the SDK dropped it.
