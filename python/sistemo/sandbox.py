@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import time
 import uuid
+import warnings
 from dataclasses import dataclass
 from typing import Iterator
 
-from ._client import Client, Page, _qs
+from ._client import _RETRY_STATUSES, Client, Page, _qs, retry_delay
 from .errors import (
     APIError,
     ExecStartUnconfirmed,
@@ -15,6 +16,7 @@ from .errors import (
     InvalidArgumentError,
     NotFoundError,
     SistemoError,
+    _InvalidArgumentTypeError,
 )
 from .jobs import Job
 
@@ -520,10 +522,45 @@ class Sandbox:
         """Delete a snapshot (``DELETE /v1/snapshots/{id}``)."""
         return self._client.delete_snapshot(snapshot_id)
 
-    def close(self, preserve_storage: bool = False) -> None:
-        """Destroy the sandbox (and its disk unless ``preserve_storage``)."""
+    def close(self, preserve_storage: bool = False, *, timeout: float | None = None) -> None:
+        """Destroy the sandbox (and its disk unless ``preserve_storage``).
+
+        Keeps trying until the machine is deleted — through rate limits (honouring
+        ``Retry-After``), dropped connections and a machine still mid-transition —
+        for up to ``timeout`` seconds (default :data:`CLOSE_TIMEOUT`, 120), whatever
+        the client's ``max_retries``. A machine that is already gone counts as
+        closed. Raises only when it truly could not delete it in time, or the API
+        refused for a reason waiting cannot fix (e.g. it has snapshots).
+
+        ⚠ It used to get the client's ordinary 2 retries: tearing down 20
+        machines in parallel after creating them, 11–13 ``close()`` calls raised
+        RateLimitError and those machines stayed running and billed (audit AD1).
+        ``close()`` sits in ``finally`` blocks that nobody wraps in a retry.
+        """
         query = "?preserve_storage=true" if preserve_storage else ""
-        self._client.request("DELETE", f"/v1/machines/{self.id}{query}")
+        path = f"/v1/machines/{self.id}{query}"
+        deadline = _monotonic() + (CLOSE_TIMEOUT if timeout is None else max(0.0, timeout))
+        attempt = 0
+        while True:
+            try:
+                self._client.request("DELETE", path, max_retries=0)
+                return
+            except NotFoundError:
+                return  # already deleted — e.g. an earlier attempt whose answer was lost
+            except APIError as e:
+                if not _close_should_wait(e):
+                    raise
+                last: SistemoError = e
+                api_err: APIError | None = e
+            except SistemoError as e:  # no answer: a DELETE is safe to repeat
+                last, api_err = e, None
+            delay = retry_delay(
+                attempt, self._client.retry_backoff, self._client.retry_max_backoff, api_err
+            )
+            if _monotonic() + delay > deadline:
+                raise last
+            _sleep(delay)
+            attempt += 1
 
     def __enter__(self) -> "Sandbox":
         return self
@@ -531,8 +568,33 @@ class Sandbox:
     def __exit__(self, *_exc) -> None:
         try:
             self.close()
-        except Exception:
-            pass  # best-effort cleanup; never mask the original error
+        except Exception as e:
+            # Never mask the block's own error — but never hide a machine that is
+            # still running either. This used to be a bare `pass`, so a failed
+            # teardown left a billed machine with no trace in the program.
+            warnings.warn(
+                f"sistemo: could not delete machine {self.id} ({e}); it is still running "
+                "and billed — call close() again or delete it in the dashboard",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+
+#: How long :meth:`Sandbox.close` keeps trying to delete a machine, in seconds.
+CLOSE_TIMEOUT = 120.0
+
+# Seams for the close() tests, so they need not sleep.
+_sleep = time.sleep
+_monotonic = time.monotonic
+
+
+def _close_should_wait(e: APIError) -> bool:
+    """Whether a refused delete will succeed if close() waits and asks again:
+    a rate limit or a server-side hiccup, or a machine still mid-transition (409
+    invalid_state_transition — e.g. already being deleted, or still starting)."""
+    if e.status in _RETRY_STATUSES:
+        return True
+    return e.status == 409 and getattr(e, "code", None) == "invalid_state_transition"
 
 
 def _check_network_args(network: str | None, allow) -> None:
@@ -541,7 +603,7 @@ def _check_network_args(network: str | None, allow) -> None:
         raise InvalidArgumentError(f'network must be "open" or "locked" (got {network!r})')
     if isinstance(allow, str):
         # A bare string would be iterated into single characters.
-        raise TypeError("allow must be a list of host names, e.g. [\"pypi.org\"]")
+        raise _InvalidArgumentTypeError("allow must be a list of host names, e.g. [\"pypi.org\"]")
     if allow and network != "locked":
         raise InvalidArgumentError('allow only applies when network="locked"')
 

@@ -1363,23 +1363,23 @@ describe("0.1.8 surface", () => {
     assert.deepEqual((await c.listSnapshots()).snapshots, []);
   });
 
-  it("asyncDispose closes and swallows a close error", async () => {
+  it("asyncDispose closes, and gets through a transient close error (audit AD1)", async () => {
     const sb = await Sandbox.create({ apiKey: "k", baseUrl });
     const id = sb.id;
     await sb[Symbol.asyncDispose]();
     assert.equal(state.machines.has(id), false);
 
-    // maxRetries: 0 — DELETE retries 5xx, and a retry would hide the error
-    // this is supposed to swallow.
-    const sb2 = await Sandbox.create({ apiKey: "k", baseUrl, maxRetries: 0 });
+    // A 500 on the delete used to be tried once and swallowed, leaving the
+    // machine running and billed. close() now keeps trying (whatever maxRetries
+    // says), so the machine is gone. A refusal waiting cannot fix is reported
+    // as a warning — see close.test.mjs.
+    const sb2 = await Sandbox.create({ apiKey: "k", baseUrl, maxRetries: 0, retryBackoffMs: 1 });
     state.failNext = { status: 500, body: { detail: "no" } };
     const mark = state.log.length;
     await sb2[Symbol.asyncDispose]();
-    // The id is reused once the first machine is gone (`m-${size+1}`), so
-    // count only the deletes this call made.
     const deletes = state.log.slice(mark).filter((l) => l.method === "DELETE");
-    assert.equal(deletes.length, 1);
-    assert.equal(state.machines.has(sb2.id), true);
+    assert.equal(deletes.length, 2);
+    assert.equal(state.machines.has(sb2.id), false);
   });
 
   it("await using runs close", { skip: !parsesAwaitUsing }, async () => {

@@ -312,6 +312,11 @@ a `400`, never a silent override. Every bind and unbind is in the Activity feed
 
 ## Changelog
 
+### 0.2.4
+
+- `Sandbox.close()` keeps trying until the machine is deleted — through rate limits (honouring `Retry-After`), dropped connections and a machine still mid-transition — for up to `timeoutMs` (default `CLOSE_TIMEOUT_MS`, 120 s), whatever `maxRetries` says. A machine already gone counts as closed. Tearing many machines down at once no longer leaves some running and billed.
+- `await using` that could not delete its machine now reports it (`process.emitWarning`, or `console.warn` outside Node) instead of failing silently.
+
 ### 0.2.3
 
 - `ExecResult.oomKilled` and `Job.oomKilled`: true when the machine ran out of memory and the kernel killed the command (usually exit code 137). The API has reported it; the SDK dropped it.

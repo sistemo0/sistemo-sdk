@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.2.3";
+const USER_AGENT = "@sistemo/sdk/0.2.4";
 
 /**
  * After a POST /execs whose ACK was lost, GET of the minted id retries 404
@@ -241,6 +241,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** How long {@link Sandbox.close} keeps trying to delete a machine, in ms. */
+export const CLOSE_TIMEOUT_MS = 120_000;
+
+/**
+ * Whether a refused delete succeeds if close() waits and asks again: a rate
+ * limit or a server-side hiccup, or a machine still mid-transition (409
+ * invalid_state_transition — already being deleted, or still starting).
+ */
+function closeShouldWait(e: APIError): boolean {
+  if (RETRY_STATUSES.has(e.status)) return true;
+  return e.status === 409 && e.code === "invalid_state_transition";
+}
+
 /** Monotonic ms. `Date.now()` can jump; the 404-retry deadline must not. */
 function monotonicMs(): number {
   const p = (globalThis as { performance?: { now?: () => number } }).performance;
@@ -344,6 +357,14 @@ export class Client {
     this.maxRetries = opts.maxRetries ?? 2;
     this.retryBackoffMs = opts.retryBackoffMs ?? 400;
     this.retryMaxBackoffMs = opts.retryMaxBackoffMs ?? 8_000;
+  }
+
+  /**
+   * @internal The wait before retry `attempt`, by this client's backoff settings
+   * (used by {@link Sandbox.close}).
+   */
+  retryDelayFor(attempt: number, err?: { status: number; retryAfter?: number }): number {
+    return retryDelayMs(attempt, this.retryBackoffMs, this.retryMaxBackoffMs, err);
   }
 
   async request<T>(
@@ -834,7 +855,7 @@ const MAX_IDEMPOTENCY_KEY_LEN = 255;
 
 function checkIdempotencyKey(key: string | undefined): void {
   if (key === undefined) return;
-  if (key.length > MAX_IDEMPOTENCY_KEY_LEN || !/^[!-~]+$/.test(key)) {
+  if (key.length === 0 || key.length > MAX_IDEMPOTENCY_KEY_LEN || !/^[!-~]+$/.test(key)) {
     throw new SistemoError(
       `idempotencyKey must be 1-${MAX_IDEMPOTENCY_KEY_LEN} printable ASCII characters with no spaces (got ${key.length}) — a UUID is ideal`,
     );
@@ -1139,21 +1160,57 @@ export class Sandbox {
     }
   }
 
-  /** Destroy the sandbox (and its disk unless `preserveStorage`). */
-  async close(preserveStorage = false): Promise<void> {
+  /**
+   * Destroy the sandbox (and its disk unless `preserveStorage`).
+   *
+   * Keeps trying until the machine is deleted — through rate limits (honouring
+   * `Retry-After`), dropped connections and a machine still mid-transition — for
+   * up to `timeoutMs` (default {@link CLOSE_TIMEOUT_MS}, 120 s), whatever the
+   * client's `maxRetries`. A machine that is already gone counts as closed. It
+   * throws only when it truly could not delete in time, or the API refused for a
+   * reason waiting cannot fix (e.g. the machine has snapshots).
+   *
+   * ⚠ It used to get the client's ordinary 2 retries: tearing down 20 machines
+   * in parallel after creating them, 11–13 `close()` calls threw and those
+   * machines stayed running and billed (audit AD1).
+   */
+  async close(preserveStorage = false, opts: { timeoutMs?: number } = {}): Promise<void> {
     const q = preserveStorage ? "?preserve_storage=true" : "";
-    await this.client.request("DELETE", `/v1/machines/${this.id}${q}`);
+    const path = `/v1/machines/${this.id}${q}`;
+    const deadline = monotonicMs() + Math.max(0, opts.timeoutMs ?? CLOSE_TIMEOUT_MS);
+    for (let attempt = 0; ; attempt++) {
+      let apiErr: APIError | undefined;
+      try {
+        await this.client.request("DELETE", path, undefined, { maxRetries: 0 });
+        return;
+      } catch (e) {
+        if (e instanceof NotFoundError) return; // already deleted
+        if (e instanceof APIError) {
+          if (!closeShouldWait(e)) throw e;
+          apiErr = e;
+        } else if (!(e instanceof SistemoError)) {
+          throw e;
+        }
+        const delay = this.client.retryDelayFor(attempt, apiErr);
+        if (monotonicMs() + delay > deadline) throw e;
+        await sleep(delay);
+      }
+    }
   }
 
   /**
-   * `await using` calls {@link close}. A failure there is swallowed, matching
-   * Python `__exit__`, so it cannot mask the error from the block.
+   * `await using` calls {@link close}. A failure there never masks the error
+   * from the block — but it is reported, never swallowed: a bare catch used to
+   * leave a billed machine with no trace in the program.
    */
   async [Symbol.asyncDispose](): Promise<void> {
     try {
       await this.close();
-    } catch {
-      // best-effort cleanup
+    } catch (e) {
+      const msg = `sistemo: could not delete machine ${this.id} (${(e as Error)?.message ?? e}); it is still running and billed — call close() again or delete it in the dashboard`;
+      const proc = (globalThis as { process?: { emitWarning?: (m: string) => void } }).process;
+      if (typeof proc?.emitWarning === "function") proc.emitWarning(msg);
+      else console.warn(msg);
     }
   }
 
