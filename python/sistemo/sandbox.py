@@ -8,7 +8,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Iterator
 
-from ._client import _RETRY_STATUSES, Client, Page, _qs, retry_delay
+from ._client import _RETRY_STATUSES, Client, Page, _check_idempotency_key, _qs, retry_delay
 from .errors import (
     APIError,
     ExecStartUnconfirmed,
@@ -19,17 +19,6 @@ from .errors import (
     _InvalidArgumentTypeError,
 )
 from .jobs import Job
-
-# 409s that mean the POST did not start this id. GET would 404 a fresh UUID.
-_SKIP_GET_409 = frozenset(
-    {
-        "too_many_execs",
-        "machine_process_limit",
-        "machine_disk_full",
-        "machine_out_of_memory",
-        "machine_not_running",
-    }
-)
 
 # After a POST /execs whose ACK was lost, GET of the minted id retries 404 for
 # this long. The API can 404 for 0.2–0.5 s while still accepting the request;
@@ -149,7 +138,11 @@ class Sandbox:
         if secrets:
             body["secrets"] = list(secrets)
         # Stable key for this create so client/network retries cannot double-boot.
-        key = idempotency_key or str(uuid.uuid4())
+        # ⚠ `is None`, not `or`: "" must reach the check and be refused, as in
+        # Client(); `or` replaced it with a fresh key, so a create the caller
+        # meant to make retry-safe silently was not.
+        _check_idempotency_key(idempotency_key)
+        key = str(uuid.uuid4()) if idempotency_key is None else idempotency_key
         machine = self._client.request(
             "POST", "/v1/machines", body, idempotency_key=key
         )
@@ -269,7 +262,8 @@ class Sandbox:
 
         ⚠ You mint ``exec_id`` (a UUID is generated if you omit it). If the
         start response is lost, poll that id rather than starting again.
-        Re-sending the same id is a 409 ``exec_id_in_use``, not a second run.
+        Re-sending the same id raises :class:`~sistemo.errors.APIError` 409
+        ``exec_id_in_use`` — nothing runs; use :meth:`job` to look the first one up.
         ``too_many_execs`` is :class:`~sistemo.errors.TooManyExecsError`: wait
         for a command to finish.
 
@@ -292,11 +286,12 @@ class Sandbox:
                 body,
                 max_retries=0,
             )
-        except APIError as e:
-            if e.status == 409:
-                if e.code in _SKIP_GET_409:
-                    raise
-                return self._job_after_unconfirmed_start(eid, e)
+        except APIError:
+            # Every definite answer stands — a 409 included. ⚠ exec_id_in_use is
+            # NOT "already started, here it is": the POST is sent once, never
+            # retried, so a 409 for this id means the CALLER reused it, and
+            # handing back that old job silently dropped the new command (0.2.4).
+            # A lost start is the connection branch below.
             raise
         except SistemoError as e:
             # Connection / timeout / invalid JSON. The POST is not retried

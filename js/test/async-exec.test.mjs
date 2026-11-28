@@ -7,6 +7,7 @@ import { createServer } from "node:http";
 import { after, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  APIError,
   AsyncExecUnsupportedError,
   ExecStartUnconfirmed,
   GoneError,
@@ -214,16 +215,22 @@ describe("start semantics", () => {
     assert.equal(job.id, ids[0]);
   });
 
-  it("a 409 returns the existing job, not a second run", async () => {
-    scene.startStatus = 409;
-    scene.startBody = { detail: "exec_id already exists" };
-    scene.job = jobRec("running");
-    const sb = await newSandbox();
-    const job = await sb.start("echo hi", 120, { execId: scene.job.exec_id });
-    assert.equal(job.id, scene.job.exec_id);
-    assert.equal(job.state, "running");
-    assert.equal((scene.starts ?? []).length, 1);
-  });
+  // ⚠ Audit AF2 (0.2.4): a reused execId returned the OLD job and the new
+  // command never ran. The POST is sent once, so a 409 means the caller reused it.
+  for (const code of ["exec_id_in_use", "conflict", undefined]) {
+    it(`a reused execId (${code}) throws, never the old job`, async () => {
+      scene.startStatus = 409;
+      scene.startBody = { code, detail: "exec_id already exists" };
+      scene.job = jobRec("running");
+      const sb = await newSandbox();
+      await assert.rejects(
+        () => sb.start("echo B", 120, { execId: scene.job.exec_id }),
+        (err) => err instanceof APIError && err.status === 409,
+      );
+      assert.equal((scene.gets ?? []).length, 0, "must not look the old job up");
+      assert.equal((scene.starts ?? []).length, 1);
+    });
+  }
 
   for (const [code, name] of [
     ["too_many_execs", "TooManyExecsError"],

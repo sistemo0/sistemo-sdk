@@ -227,7 +227,8 @@ except ExecStartUnconfirmed as e:
 ```
 
 You mint `exec_id` (a UUID is generated if you omit it). Re-sending the same id
-is a 409 and returns the existing job, not a second run. If start raises
+raises `APIError` 409 `exec_id_in_use` and nothing runs — look the first one up
+with `job()`. If start raises
 `ExecStartUnconfirmed`, poll that id — do not start again.
 
 The 17th concurrent command is `TooManyExecsError` (`too_many_execs`): wait for
@@ -303,6 +304,12 @@ a `400`, never a silent override. Every bind and unbind is in the Activity feed
 (names only).
 
 ## Changelog
+
+### 0.2.5
+
+- `start()` with an `exec_id` that is already in use raises `APIError` 409 `exec_id_in_use`. It returned the earlier job instead, so the new command silently never ran.
+- Retries honour `Retry-After` on a `503` as well as a `429`; the API sends it on every retryable `503`.
+- `Sandbox(idempotency_key="")` raises `InvalidArgumentError`, as `Client` already did; it was replaced by a generated key.
 
 ### 0.2.4
 

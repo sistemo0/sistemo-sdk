@@ -829,6 +829,17 @@ class SDKTest(unittest.TestCase):
         self.assertGreaterEqual(d, 12)
         self.assertLessEqual(d, 60)
 
+    def test_retry_delay_honours_retry_after_on_a_503(self) -> None:
+        """Audit AF4: the API sends Retry-After on every retryable 503; it was ignored."""
+        from sistemo._client import retry_delay
+        from sistemo.errors import APIError
+
+        err = APIError(503, "busy", "no_host_available", retry_after=5)
+        self.assertGreaterEqual(retry_delay(0, 0.01, 8.0, err, rng=lambda: 0.5), 5)
+        # Without the header a 503 keeps the ordinary short backoff.
+        bare = APIError(503, "busy", "no_host_available")
+        self.assertLess(retry_delay(0, 0.01, 8.0, bare, rng=lambda: 0.5), 1)
+
     def test_retry_after_is_spread_so_refused_callers_do_not_return_together(self) -> None:
         from sistemo._client import retry_delay
         from sistemo.errors import RateLimitError

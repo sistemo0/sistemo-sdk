@@ -17,7 +17,7 @@ const DEFAULT_BASE_URL = "https://api.sistemo.io";
 // User-Agent is required: the production WAF (Cloudflare) blocks generic
 // library UAs with a 403. Browsers ignore attempts to set User-Agent and send
 // their own (which the WAF allows), so this is a no-op there.
-const USER_AGENT = "@sistemo/sdk/0.2.4";
+const USER_AGENT = "@sistemo/sdk/0.2.5";
 
 /**
  * After a POST /execs whose ACK was lost, GET of the minted id retries 404
@@ -220,7 +220,7 @@ function apiError(
     if (code === "machine_disk_full") return new DiskFullError(status, detail, code, body, extra);
     if (code === "machine_out_of_memory") return new OutOfMemoryError(status, detail, code, body, extra);
     if (code === "machine_not_running") return new MachineNotRunningError(status, detail, code, body, extra);
-    // exec_id_in_use / conflict: start() recovers those by GET.
+    // exec_id_in_use / conflict: a plain APIError — nothing started.
   }
   if (status === 501) return new AsyncExecUnsupportedError(status, detail, code, body, extra);
   // ⚠ Only a 503 that NAMES an exec is the unconfirmed-start case. A plain 503
@@ -298,9 +298,11 @@ export function retryDelayMs(
 ): number {
   const base = Math.min(maxBackoffMs, backoffMs * 2 ** attempt);
   let delay = base * (0.5 + rand());
-  if (err?.status === 429) {
+  // Retry-After is honoured on a 503 as well as a 429: the API sends it on every
+  // retryable 503 (a busy host, an unconfirmed answer).
+  if (err?.status === 429 || err?.status === 503) {
     if (err.retryAfter == null) {
-      delay = Math.max(delay, base);
+      if (err.status === 429) delay = Math.max(delay, base);
     } else {
       // Spread over up to half as long again as Retry-After, so callers refused
       // by the same limit do not all return in the same instant (audit Z5).
@@ -1039,7 +1041,8 @@ export class Sandbox {
    *
    * ⚠ You mint `execId` (a UUID is generated if you omit it). If the start
    * response is lost, poll that id rather than starting again. Re-sending the
-   * same id is a 409 `exec_id_in_use`, not a second run. `too_many_execs` is
+   * same id throws {@link APIError} 409 `exec_id_in_use` — nothing runs; use
+   * {@link job} to look the first one up. `too_many_execs` is
    * {@link TooManyExecsError}: wait for a command to finish.
    *
    * ⚠ On {@link ExecStartUnconfirmed} the command **may be running**. The error
@@ -1065,18 +1068,10 @@ export class Sandbox {
       );
       return new Job(this.client, this.id, rec);
     } catch (e) {
-      if (e instanceof APIError && e.status === 409) {
-        if (
-          e.code === "too_many_execs" ||
-          e.code === "machine_process_limit" ||
-          e.code === "machine_disk_full" ||
-          e.code === "machine_out_of_memory" ||
-          e.code === "machine_not_running"
-        ) {
-          throw e;
-        }
-        return this.jobAfterUnconfirmedStart(execId, e);
-      }
+      // Every definite answer stands — a 409 included. ⚠ exec_id_in_use is NOT
+      // "already started, here it is": the POST is sent once, never retried, so a
+      // 409 for this id means the CALLER reused it, and handing back that old job
+      // silently dropped the new command (0.2.4). A lost start is the branch below.
       if (e instanceof SistemoError && !(e instanceof APIError)) {
         return this.jobAfterUnconfirmedStart(execId, e);
       }

@@ -225,7 +225,7 @@ def api_error(
             return OutOfMemoryError(status, detail, code, body, **kw)
         if code == "machine_not_running":
             return MachineNotRunningError(status, detail, code, body, **kw)
-        # exec_id_in_use / conflict: start() recovers those by GET.
+        # exec_id_in_use / conflict: a plain APIError — nothing started.
     if status == 501:
         return AsyncExecUnsupportedError(status, detail, code, body, **kw)
     # ⚠ Only a 503 that NAMES an exec is the unconfirmed-start case. A plain 503
