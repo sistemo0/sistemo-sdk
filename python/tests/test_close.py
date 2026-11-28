@@ -111,6 +111,12 @@ class ValidationEdgesTest(unittest.TestCase):
         with self.assertRaises(InvalidArgumentError):
             c.request("POST", "/v1/machines", {}, idempotency_key="")
 
+    def test_sandbox_refuses_an_empty_idempotency_key_like_client(self):
+        """Audit AE2: Sandbox(idempotency_key="") was accepted (``or`` swapped in a
+        fresh key), while Client refused it. Refused before any request."""
+        with self.assertRaises(InvalidArgumentError):
+            Sandbox(api_key="k", base_url="http://127.0.0.1:9", idempotency_key="")
+
     def test_allow_as_a_string_is_an_invalid_argument_and_still_a_typeerror(self):
         with self.assertRaises(InvalidArgumentError) as cm:
             sandbox_mod._check_network_args("locked", "pypi.org")

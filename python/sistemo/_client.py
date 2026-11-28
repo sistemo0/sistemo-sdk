@@ -61,16 +61,18 @@ def retry_delay(
     """Seconds to wait before the next attempt. Tests pass ``rng`` so they do not sleep."""
     base = min(max_backoff, backoff * (2**attempt))
     delay = base * (0.5 + rng())
-    if err is not None and err.status == 429:
-        if err.retry_after is None:
-            delay = max(delay, min(max_backoff, base))
-        else:
-            # Spread clients over up to half as long again as Retry-After: every
-            # caller refused by the same limit is told the same number, and
-            # waiting exactly that long brings them all back in the same instant
-            # (audit Z5 — 3 of 20 parallel creates gave up that way).
-            spread = err.retry_after * (1 + 0.5 * rng())
-            delay = min(max(delay, spread), _RETRY_AFTER_CAP)
+    # Retry-After is honoured on a 503 as well as a 429: the API sends it on every
+    # retryable 503 (a busy host, an unconfirmed answer), and ignoring it there
+    # re-asked a host that had just said "not yet".
+    if err is not None and err.status == 429 and err.retry_after is None:
+        delay = max(delay, min(max_backoff, base))
+    elif err is not None and err.status in (429, 503) and err.retry_after is not None:
+        # Spread clients over up to half as long again as Retry-After: every
+        # caller refused by the same limit is told the same number, and
+        # waiting exactly that long brings them all back in the same instant
+        # (audit Z5 — 3 of 20 parallel creates gave up that way).
+        spread = err.retry_after * (1 + 0.5 * rng())
+        delay = min(max(delay, spread), _RETRY_AFTER_CAP)
     return delay
 
 DEFAULT_BASE_URL = "https://api.sistemo.io"

@@ -239,16 +239,26 @@ class AsyncExecTest(unittest.TestCase):
         self.assertTrue(keys, "start() sent no exec_id")
         self.assertEqual(job.id, keys[0])
 
-    def test_start_409_returns_the_existing_job(self):
-        """Re-sending the same exec_id is a replay, not a second run."""
-        SCENE["start_status"] = 409
-        SCENE["start_body"] = {"detail": "exec_id already exists"}
-        SCENE["job"] = job_rec("running")
-        sb = self.sandbox()
-        job = sb.start("echo hi", exec_id=SCENE["job"]["exec_id"])
-        self.assertEqual(job.id, SCENE["job"]["exec_id"])
-        self.assertEqual(job.state, "running")
-        self.assertEqual(len(SCENE.get("starts", [])), 1)
+    def test_start_reused_exec_id_raises(self):
+        """⚠ A reused exec_id is an error, never the old job (audit AF2, 0.2.4).
+
+        The POST is sent once, so a 409 means the caller reused the id; returning
+        the existing job silently dropped the new command.
+        """
+        from sistemo.errors import APIError
+
+        for code in ("exec_id_in_use", "conflict", None):
+            with self.subTest(code=code):
+                SCENE.clear()
+                SCENE["start_status"] = 409
+                SCENE["start_body"] = {"code": code, "detail": "exec_id already exists"}
+                SCENE["job"] = job_rec("running")
+                sb = self.sandbox()
+                with self.assertRaises(APIError) as cm:
+                    sb.start("echo B", exec_id=SCENE["job"]["exec_id"])
+                self.assertEqual(cm.exception.status, 409)
+                self.assertFalse(SCENE.get("gets"), "must not look the old job up")
+                self.assertEqual(len(SCENE.get("starts", [])), 1)
 
     def test_start_refused_409s_do_not_get(self):
         from sistemo.errors import (

@@ -1,6 +1,6 @@
 {
   "name": "@sistemo/sdk",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Run AI agents and untrusted code in real isolated microVMs.",
   "license": "Apache-2.0",
   "author": "Sistemo",

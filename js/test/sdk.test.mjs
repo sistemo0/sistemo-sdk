@@ -988,6 +988,13 @@ describe("request id and Retry-After", () => {
     assert.ok(d <= 60_000, `delay ${d} must cap at 60s`);
   });
 
+  it("retryDelayMs honours Retry-After on a 503 (audit AF4)", () => {
+    const err = new APIError(503, "busy", "no_host_available", {}, { retryAfter: 5 });
+    assert.ok(retryDelayMs(0, 10, 8000, err, () => 0.5) >= 5000);
+    const bare = new APIError(503, "busy", "no_host_available", {});
+    assert.ok(retryDelayMs(0, 10, 8000, bare, () => 0.5) < 1000, "no header: ordinary backoff");
+  });
+
   it("Retry-After is spread so refused callers do not return together", () => {
     const err = new RateLimitError(429, "slow", "rate_limited", {}, { retryAfter: 2 });
     const lo = retryDelayMs(0, 10, 8000, err, () => 0);
